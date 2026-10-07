@@ -64,13 +64,31 @@ def trade_kill(t) -> str | None:
     return None
 
 
+def top_10_kill(d) -> str | None:
+    """Invalid data (NaN, infinite, negative, malformed, over 100%) is rejected as
+       top_10_invalid; an observed share over the maximum as top_10_above_max. A MISSING
+       share is not rejected here: thresholds.MISSING_DATA cuts the ticket instead."""
+    q = (d.get("data_quality") or {}).get("top_10_share") or {}
+    s = d.get("top_10_share")
+    if q.get("status") == "invalid":
+        return "top_10_invalid"
+    if s is None:
+        return None
+    if isinstance(s, bool) or not isinstance(s, (int, float)) or not math.isfinite(s) \
+            or not 0 <= s <= 1:
+        return "top_10_invalid"
+    if s > HARD["max_top_10"]:
+        return "top_10_above_max"
+    return None
+
+
 def chain_kill(d) -> str | None:
     """After the dossier, still free. Facts, not judgements."""
     if d.get("top_wallet_share") is not None and \
        d["top_wallet_share"] > HARD["max_top_wallet"]:
         return "top_wallet"
-    if d.get("top_10_share") is not None and d["top_10_share"] > HARD["max_top_10"]:
-        return "top_10"
+    if (k := top_10_kill(d)):
+        return k
     if d.get("holder_count") is not None and d["holder_count"] < HARD["min_holders"]:
         return "holders"
     if d["chain"] == "solana" and (d.get("mint_authority_open") is True or

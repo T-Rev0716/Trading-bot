@@ -12,7 +12,7 @@ import requests
 
 from fomo_api import Fomo
 from ids import CHAIN_NAME, token_key
-from values import raw_for_record
+from values import parse_metric, raw_for_record
 
 GT  = "https://api.geckoterminal.com/api/v2"
 DEX = "https://api.dexscreener.com/latest/dex/tokens"
@@ -220,21 +220,36 @@ def flag(v) -> bool | None:
     return None
 
 
+TOP10_FIELD = "holders.distribution_percentage.top_10"
+
+
+def parse_share(pct) -> tuple[float | None, dict]:
+    """GeckoTerminal distribution is a percent string; the desk uses fractions.
+       Strict: NaN, infinite, negative, malformed, or over 100% is invalid, never a share."""
+    m = parse_metric(pct)
+    status, kind = m.status, m.kind
+    if status == "ok" and m.value > 100:
+        status, kind = "invalid", "above_100_percent"
+    return (m.value / 100 if status == "ok" else None,
+            {"source": "geckoterminal", "source_field": TOP10_FIELD,
+             "raw": raw_for_record(pct), "status": status, "invalid_kind": kind})
+
+
 def share(pct) -> float | None:
-    """GeckoTerminal distribution is a percent string. The desk uses fractions."""
-    try:
-        return float(pct) / 100 if pct is not None else None
-    except (TypeError, ValueError):
-        return None
+    return parse_share(pct)[0]
 
 
 def dossier(t: dict) -> dict:
     """One GT call per token. Fills what the chain actually has, null where it does not."""
     net = t["chain"]
     g = parse_token_info(gt_get(f"/networks/{net}/tokens/{t['addr']}/info"))
+    fetched = time.time()                               # local clock, not GT's
+    top10 = {**g.pop("top_10_quality"), "fetched_at_local": fetched,
+             "provider_timestamp": None}                # GT token info sends none
     # GT first, FOMO as the fallback. On Robinhood GT is null and FOMO is all you get.
     d = {**t, **g, "holder_count": g["holder_count"] or t["holder_count"],
-         "top_wallet_share": None}
+         "top_wallet_share": None,
+         "data_quality": {**(t.get("data_quality") or {}), "top_10_share": top10}}
 
     # Solana only: exact top wallet share, free, off the public RPC
     if t["net"] == 1399811149:
@@ -249,9 +264,10 @@ def parse_token_info(body: dict) -> dict:
     """GT token info body -> the desk's GT-derived fields. Units: shares are fractions."""
     a = body["data"]["attributes"]
     holders = a.get("holders") or {}
+    top10, top10_quality = parse_share((holders.get("distribution_percentage") or {})
+                                       .get("top_10"))
     return {"holder_count": holders.get("count"),
-            "top_10_share": share((holders.get("distribution_percentage") or {})
-                                  .get("top_10")),
+            "top_10_share": top10, "top_10_quality": top10_quality,
             "developer_holding_percentage": a.get("developer_holding_percentage"),
             "gt_score_details": a.get("gt_score_details"),
             "is_honeypot": flag(a.get("is_honeypot")),

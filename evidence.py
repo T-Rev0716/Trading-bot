@@ -25,20 +25,31 @@ _FIELDS = {
     "liquidity": ("liquidity_usd", lambda: {"min": HARD["min_liquidity_usd"]}),
     "volume": ("volume_h24", lambda: {"min": HARD["min_volume_h24"]}),
     "mcap": ("mcap_usd", lambda: {"min": HARD["min_mcap_usd"], "max": HARD["max_mcap_usd"]}),
+    "top_10": ("top_10_share", lambda: {"max": HARD["max_top_10"]}),
 }
 
 
+def _field(reason: str):
+    """The longest known prefix: 'top_10_invalid' is top_10, not 'top'."""
+    keys = [k for k in _FIELDS if reason == k or reason.startswith(k + "_")]
+    return _FIELDS[max(keys, key=len)]
+
+
 def example(t: dict, reason: str) -> dict:
-    """One rejection, as the screen saw it. Only for screen (free_kill) reasons."""
-    field, threshold = _FIELDS[reason.split("_", 1)[0]]
+    """One rejection, as the check saw it: the screen (age, liquidity, volume, mcap) or
+       the top_10 chain check. A field's own fetch time and provider timestamp (GT for
+       top_10) win over the row's (FOMO)."""
+    field, threshold = _field(reason)
     q = (t.get("data_quality") or {}).get(field) or {}
     return {"token_key": t.get("token_key"), "tid": t.get("tid"), "ticker": t.get("ticker"),
             "source": q.get("source"), "source_field": q.get("source_field"),
             "raw": sanitize.data(q.get("raw")), "parse_status": q.get("status"),
             "invalid_kind": q.get("invalid_kind"), "parsed": t.get(field),
             "threshold": threshold(),
-            "fetched_at_local": t.get("fetched_at_local"),
-            "provider_timestamp": sanitize.data(t.get("provider_timestamp"))}
+            "fetched_at_local": q.get("fetched_at_local", t.get("fetched_at_local")),
+            "provider_timestamp": sanitize.data(q["provider_timestamp"]
+                                                if "provider_timestamp" in q
+                                                else t.get("provider_timestamp"))}
 
 
 class EvidenceLog:

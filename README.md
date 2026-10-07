@@ -105,8 +105,15 @@ Now:
   together with the newest pages, so a token is judged on current data once it matures,
   even after it has left discovery.
 - An entry expires at launch time + 72 h (the max age); one observed too old, or rejected
-  for a permanent fact, is dropped. At most 200 entries; the earliest discovered is
-  evicted first. Re-fetching costs one FOMO call per 20 tokens.
+  for a permanent fact, is dropped. At most 200 entries. Re-fetching costs one FOMO call
+  per 20 tokens.
+- A scan applies its watchlist changes **once, atomically**, after evaluating every row:
+  drops, then refreshes (first_seen kept) and inserts (first_seen = now), then eviction
+  down to 200 by (first_seen, address). Applying them row by row used to let a watched
+  token evicted for a new one be re-inserted by its own row later in the same batch, with
+  a fresh first_seen, evicting another: real scans showed 33 and 40 discoveries costing
+  58 and 56 evictions. Each scan now reports `eviction_operations` separately from
+  `removed_tokens` (unique tokens gone from the final list: expired, dropped, evicted).
 - A token skipped because the cycle's DexScreener / GeckoTerminal budget ran out stays
   watched and is tried next cycle (`deferred_budget`), instead of being lost.
 
@@ -124,6 +131,13 @@ before:
 | missing | `liquidity_missing`, `volume_missing`, `mcap_missing` | absent, `null`, `""` |
 | invalid | `liquidity_invalid`, `volume_invalid`, `mcap_invalid` | `NaN`, `Infinity`, `-5`, `"1,234"`, `true` |
 | out of range | `liquidity_below_min`, `volume_below_min`, `mcap_below_min`, `mcap_above_max` | `0`, `11999` |
+
+The `top_10` chain check (GeckoTerminal `holders.distribution_percentage.top_10`, a
+percent) is split the same way: `top_10_above_max` for an observed share over 60%,
+`top_10_invalid` for NaN, infinite, negative, malformed or over-100% values. A missing
+share is still not a rejection; `thresholds.MISSING_DATA` cuts the ticket, as before. A
+NaN share used to pass the check and escape that cut. Both reasons keep the 90-minute
+bench and record evidence like the screen does, with GeckoTerminal's own fetch time.
 
 Zero is an observed value: it fails a minimum as `below_min`, never as missing. An invalid
 value is never turned into zero or into missing. All ten reasons keep the old 25-minute

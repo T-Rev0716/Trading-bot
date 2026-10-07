@@ -90,7 +90,6 @@ def scan(fomo, judge, desk, free_cash: float, ask_judge: bool, now: float | None
     ids = list(dict.fromkeys(discovered + [w for w in watched if w not in fresh]))
     rows = shortlist(fomo, ids, now)
     returned = {t["tid"] for t in rows}
-    evicted = 0
     stats["discovery"] = {"discovered": len(fresh), "watched": len(watched),
                           "refetched_from_watchlist": len(ids) - len(fresh),
                           "requested": len(ids), "fomo_unknown": len(set(ids) - returned),
@@ -98,68 +97,85 @@ def scan(fomo, judge, desk, free_cash: float, ask_judge: bool, now: float | None
     stats["age"] = _ages(rows)
     evidence = EvidenceLog()
 
+    # Watchlist changes are collected here and applied once, atomically, after the loop
+    # (watchlist.apply_batch). Applying them row by row let an entry evicted for one new
+    # token be re-inserted by its own row later in the same batch, with a fresh
+    # first_seen, evicting another: one discovery could cost several evictions.
+    observed = [(t["tid"], t.get("created_at")) for t in rows
+                if age_band(t["age_minutes"]) != "too_old"]
+    drops = {t["tid"] for t in rows if age_band(t["age_minutes"]) == "too_old"}
+
     def reject(t, reason, stage, scope="shared"):
         book.sit(t["tid"], reason, scope, now)
         _count(stats, stage, reason)
         if scope == "shared" and book.bench_minutes(reason) >= HARD["max_age_hours"] * 60:
-            watch.drop(t["tid"])                 # a permanent fact: stop watching
+            drops.add(t["tid"])                  # a permanent fact: stop watching
+        if stage == "chain" and reason.startswith("top_10_"):
+            evidence.add(reason, t)
 
-    for t in rows:
-        stats["seen"] += 1
-        if age_band(t["age_minutes"]) == "too_old":
-            watch.drop(t["tid"])
-        else:
-            evicted += watch.observe(t["tid"], t.get("created_at"), now)
-        scope = book.benched(t["tid"], now)
-        if scope == "shared":
-            stats["benched"] += 1
-            continue
-        if (k := free_kill(t)):
-            evidence.add(k, t)
-            if k == "age_too_young":
-                _count(stats, "free", k)         # watched, not benched
-            else:
-                reject(t, k, "free")
-            continue
-        if dex_slots <= 0 or gt_slots <= 0:
-            stats["deferred_budget"] += 1        # still watched: next cycle, not never
-            continue
+    try:
+        for t in rows:
+            stats["seen"] += 1
+            scope = book.benched(t["tid"], now)
+            if scope == "shared":
+                stats["benched"] += 1
+                continue
+            if (k := free_kill(t)):
+                evidence.add(k, t)
+                if k == "age_too_young":
+                    _count(stats, "free", k)         # watched, not benched
+                else:
+                    reject(t, k, "free")
+                continue
+            if dex_slots <= 0 or gt_slots <= 0:
+                stats["deferred_budget"] += 1        # still watched: next cycle, not never
+                continue
 
-        t |= trade_counts(t)
-        dex_slots -= 1
-        if (k := trade_kill(t)):
-            reject(t, k, "trade")
-            continue
+            t |= trade_counts(t)
+            dex_slots -= 1
+            if (k := trade_kill(t)):
+                reject(t, k, "trade")
+                continue
 
-        gt_slots -= 1                            # a failed call still costs the slot
-        try:
-            d = dossier(t)
-        except Exception as e:
-            log.warning("dossier failed %s: %s", t["token_key"], e)
-            reject(t, "dossier_failed", "chain")
-            continue
-        d["x_account"] = desk.read_x(d["x_handle"]) if d["x_handle"] else None
+            gt_slots -= 1                            # a failed call still costs the slot
+            try:
+                d = dossier(t)
+            except Exception as e:
+                log.warning("dossier failed %s: %s", t["token_key"], e)
+                reject(t, "dossier_failed", "chain")
+                continue
+            d["x_account"] = desk.read_x(d["x_handle"]) if d["x_handle"] else None
 
-        v = eligibility.check(d)                 # facts + missing-data policy, both ledgers
-        if not v.ok:
-            reject(t, v.reason, "chain")
-            continue
+            v = eligibility.check(d)                 # facts + missing-data policy, both ledgers
+            if not v.ok:
+                reject(d, v.reason, "chain")
+                continue
 
-        ans = None
-        if ask_judge and scope != "strategy":
-            d["intended_ticket_usd"] = intended_ticket(free_cash)
-            ans = dict(judge("market", state_for("market", d))["answers"])
-            cs = eligibility.CHAIN_SET[d["chain"]]
-            ans |= judge(cs, state_for(cs, d))["answers"]
-            if d["x_account"]:
-                ans |= judge("social", social_state(d))["answers"]
-            sv = eligibility.check(d, ans)
-            if not sv.ok:
-                reject(t, sv.reason, "soft", scope="strategy")
-        cands.append((d, ans))
+            ans = None
+            if ask_judge and scope != "strategy":
+                d["intended_ticket_usd"] = intended_ticket(free_cash)
+                ans = dict(judge("market", state_for("market", d))["answers"])
+                cs = eligibility.CHAIN_SET[d["chain"]]
+                ans |= judge(cs, state_for(cs, d))["answers"]
+                if d["x_account"]:
+                    ans |= judge("social", social_state(d))["answers"]
+                sv = eligibility.check(d, ans)
+                if not sv.ok:
+                    reject(t, sv.reason, "soft", scope="strategy")
+            cands.append((d, ans))
+
+    finally:
+        wl = watch.apply_batch(observed, drops, now)
+        stats["discovery"] |= {
+            "watchlist_size": wl["size"], "inserted": wl["inserted"],
+            "refreshed": wl["refreshed"],
+            "eviction_operations": wl["eviction_operations"],
+            "removed_tokens": {"expired": expired, "dropped": wl["dropped"],
+                               "evicted": len(wl["evicted_tids"]),
+                               "total_unique": expired + wl["removed_unique"]},
+            "inserted_then_evicted": wl["inserted_then_evicted"]}
 
     stats["candidates"] = len(cands)
-    stats["discovery"] |= {"evicted": evicted, "watchlist_size": watch.size()}
     stats["evidence"] = evidence.dump()
     for reason, e in stats["evidence"].items():
         vals = [x["raw"] for x in e["examples"]]

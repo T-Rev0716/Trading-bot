@@ -30,7 +30,8 @@ BENCH_MINUTES = {
     # slow to change
     "recycled_account": 360, "account_is_the_project": 360,
     # can change as the float moves
-    "top_10": 90, "holders": 90, "dev_still_loaded": 90,
+    "top_10": 90, "top_10_above_max": 90, "top_10_invalid": 90,
+    "holders": 90, "dev_still_loaded": 90,
     "concentration_is_exit_risk": 90,
     # can change inside the hour, keep it short or you miss the token maturing
     "shape": 25, "shape_weak": 25, "momentum_already_spent": 25,

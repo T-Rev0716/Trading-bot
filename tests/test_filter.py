@@ -47,7 +47,7 @@ def dos(**kw):
 def test_chain_kill_facts():
     assert chain_kill(dos()) is None
     assert chain_kill(dos(top_wallet_share=0.08)) == "top_wallet"
-    assert chain_kill(dos(top_10_share=0.7)) == "top_10"
+    assert chain_kill(dos(top_10_share=0.7)) == "top_10_above_max"
     assert chain_kill(dos(holder_count=10)) == "holders"
     assert chain_kill(dos(mint_authority_open=True)) == "authority_open"
     assert chain_kill(dos(freeze_authority_open=None)) is None     # unknown -> the judge

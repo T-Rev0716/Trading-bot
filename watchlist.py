@@ -12,7 +12,12 @@ always evaluated on current data, never on what was seen when they were found.
                launch time expires max age after it was first seen.
     removal    expired, observed too old, or rejected for a reason that benches longer
                than max age (a permanent fact such as a honeypot)
-    bound      at most max_size entries; when full, the earliest discovered is evicted
+    bound      at most max_size entries; when over, the earliest discovered is evicted
+               (first_seen, then tid), once per batch
+    batches    a scan applies all its updates in one transaction (apply_batch): drops,
+               then refreshes and inserts, then capacity is enforced once. A token
+               already watched keeps its first_seen however often it is seen, and
+               nothing evicted in a batch can be re-inserted by that same batch.
     persists   in desk.db (DESK_DB), next to the bench, across restarts and resumes
 
 The scan is not replayed: its output is journaled per cycle, so the watchlist changes
@@ -57,34 +62,77 @@ class Watchlist:
             "SELECT tid FROM watchlist WHERE expires_at >= ? ORDER BY first_seen, tid",
             (now,))]
 
+    def apply_batch(self, observed: list, drops, now: float) -> dict:
+        """Apply one scan's watchlist changes atomically and report them.
+
+        observed  [(tid, created_at or None), ...] every token the scan saw that may
+                  still mature; repeats are merged (a known launch time wins)
+        drops     tids to stop watching (seen too old, or permanently benched); a drop
+                  wins over an observation of the same token in the batch
+
+        Order: drops, then refresh existing entries (first_seen kept) and insert new
+        ones (first_seen = now), then evict down to max_size by (first_seen, tid).
+        Returns counts plus the tids removed, so 'operations' and 'unique tokens' can
+        be reported apart."""
+        drops = set(drops)
+        merged: dict[str, float | None] = {}
+        for tid, created in observed:
+            if tid not in drops:
+                merged[tid] = created if created is not None else merged.get(tid)
+        lock = self.lock
+        if lock:
+            lock.acquire()
+        try:
+            with self.db:                                    # one transaction
+                before = {r[0]: r[1:] for r in self.db.execute(
+                    "SELECT tid, first_seen, created_at FROM watchlist")}
+                dropped = sorted(t for t in drops if t in before)
+                self.db.executemany("DELETE FROM watchlist WHERE tid=?",
+                                    [(t,) for t in dropped])
+                inserted, refreshed = [], []
+                for tid in sorted(merged):
+                    created = merged[tid]
+                    if tid in before and tid not in drops:
+                        first, known = before[tid]
+                        created = created if created is not None else known
+                        base = created if created is not None else first
+                        self.db.execute(
+                            "UPDATE watchlist SET last_seen=?, created_at=?, expires_at=?, "
+                            "times_seen = times_seen + 1 WHERE tid=?",
+                            (now, created, base + self.max_age_s, tid))
+                        refreshed.append(tid)
+                    else:
+                        self.db.execute(
+                            "INSERT INTO watchlist VALUES (?,?,?,?,?,1)",
+                            (tid, now, now, created,
+                             (created if created is not None else now) + self.max_age_s))
+                        inserted.append(tid)
+                over = self.db.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] \
+                    - self.max_size
+                evicted = []
+                if over > 0:
+                    evicted = [r[0] for r in self.db.execute(
+                        "SELECT tid FROM watchlist ORDER BY first_seen, tid LIMIT ?",
+                        (over,))]
+                    self.db.executemany("DELETE FROM watchlist WHERE tid=?",
+                                        [(t,) for t in evicted])
+                after = {r[0] for r in self.db.execute("SELECT tid FROM watchlist")}
+        finally:
+            if lock:
+                lock.release()
+        new_evicted = set(evicted) & set(inserted)
+        return {"inserted": len(inserted), "refreshed": len(refreshed),
+                "dropped": len(dropped), "eviction_operations": len(evicted),
+                "removed_unique": len(set(before) - after),
+                "inserted_then_evicted": len(new_evicted), "size": len(after),
+                "evicted_tids": evicted, "dropped_tids": dropped}
+
     def observe(self, tid: str, created_at: float | None, now: float) -> int:
-        """Watch a token, or refresh one already watched. A second discovery keeps the
-           first_seen time; a launch time learned later sets the expiry. Returns how many
-           entries were evicted to stay within max_size."""
-        row = self._q("SELECT first_seen, created_at FROM watchlist WHERE tid=?", (tid,))
-        if row:
-            first, known = row[0]
-            created = created_at if created_at is not None else known
-            self._q("UPDATE watchlist SET last_seen=?, created_at=?, expires_at=?, "
-                    "times_seen = times_seen + 1 WHERE tid=?",
-                    (now, created, (created if created is not None else first)
-                     + self.max_age_s, tid))
-            return 0
-        self._q("INSERT INTO watchlist VALUES (?,?,?,?,?,1)",
-                (tid, now, now, created_at,
-                 (created_at if created_at is not None else now) + self.max_age_s))
-        return self._evict()
+        """One token, as a batch of one. Returns eviction operations."""
+        return self.apply_batch([(tid, created_at)], (), now)["eviction_operations"]
 
     def drop(self, tid: str):
-        self._q("DELETE FROM watchlist WHERE tid=?", (tid,))
-
-    def _evict(self) -> int:
-        n = self._q("SELECT COUNT(*) FROM watchlist")[0][0] - self.max_size
-        if n <= 0:
-            return 0
-        self._q("DELETE FROM watchlist WHERE tid IN (SELECT tid FROM watchlist "
-                "ORDER BY first_seen, tid LIMIT ?)", (n,))
-        return n
+        self.apply_batch([], [tid], 0.0)
 
     def size(self) -> int:
         return self._q("SELECT COUNT(*) FROM watchlist")[0][0]
