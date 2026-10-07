@@ -25,6 +25,7 @@ import book
 import eligibility
 import session
 from watchlist import Watchlist
+from evidence import EvidenceLog
 from collect import universe, shortlist, trade_counts, dossier, social_state, GT_PER_MINUTE
 from filter import age_band, free_kill, trade_kill
 from questions import STATE_FIELDS
@@ -95,6 +96,7 @@ def scan(fomo, judge, desk, free_cash: float, ask_judge: bool, now: float | None
                           "requested": len(ids), "fomo_unknown": len(set(ids) - returned),
                           "expired": expired}
     stats["age"] = _ages(rows)
+    evidence = EvidenceLog()
 
     def reject(t, reason, stage, scope="shared"):
         book.sit(t["tid"], reason, scope, now)
@@ -113,6 +115,7 @@ def scan(fomo, judge, desk, free_cash: float, ask_judge: bool, now: float | None
             stats["benched"] += 1
             continue
         if (k := free_kill(t)):
+            evidence.add(k, t)
             if k == "age_too_young":
                 _count(stats, "free", k)         # watched, not benched
             else:
@@ -157,6 +160,10 @@ def scan(fomo, judge, desk, free_cash: float, ask_judge: bool, now: float | None
 
     stats["candidates"] = len(cands)
     stats["discovery"] |= {"evicted": evicted, "watchlist_size": watch.size()}
+    stats["evidence"] = evidence.dump()
+    for reason, e in stats["evidence"].items():
+        vals = [x["raw"] for x in e["examples"]]
+        log.info("rejected %s x%d, e.g. raw %s", reason, e["count"], vals)
     a = stats["age"]
     log.info("scan: %d discovered + %d re-fetched from watchlist; ages: %d missing, "
              "%d too young %s, %d in range %s, %d too old %s; %d deferred by budget",

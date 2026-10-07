@@ -53,6 +53,9 @@ same sizing and the same exits:
 | `sanitize.py`     | strips keys, auth headers, cookies and login tokens from output   |
 | `book.py`         | the bench, scoped shared or strategy-only                         |
 | `watchlist.py`    | discovered tokens watched until they mature or expire (persistent) |
+| `values.py`       | strict number parsing: ok / missing / invalid (NaN, inf, negative, malformed) |
+| `evidence.py`     | up to five recorded examples per rejection reason per cycle       |
+| `crosscheck.py`   | read-only: print recorded evidence; FOMO vs DexScreener liquidity |
 | `desk.py`         | X reads and Telegram reports. No order delivery                   |
 | `main.py`         | the paper shift                                                   |
 | `prompts/`        | the bot prompts, kept for reference. Not wired to anything        |
@@ -109,6 +112,40 @@ Now:
 
 The thresholds are unchanged. The scan's output, including the watchlist and age stats,
 is journaled per cycle, so replay and resume stay exact.
+
+## Rejection diagnostics
+
+Liquidity, 24 h volume and market cap are parsed strictly (`values.parse_metric`) and
+rejected for one of three causes, in the same order and against the same thresholds as
+before:
+
+| cause | reasons | example raw values |
+|---|---|---|
+| missing | `liquidity_missing`, `volume_missing`, `mcap_missing` | absent, `null`, `""` |
+| invalid | `liquidity_invalid`, `volume_invalid`, `mcap_invalid` | `NaN`, `Infinity`, `-5`, `"1,234"`, `true` |
+| out of range | `liquidity_below_min`, `volume_below_min`, `mcap_below_min`, `mcap_above_max` | `0`, `11999` |
+
+Zero is an observed value: it fails a minimum as `below_min`, never as missing. An invalid
+value is never turned into zero or into missing. All ten reasons keep the old 25-minute
+bench, so a token rejected on them stays on the watchlist.
+
+Two bugs this closed: a `NaN` liquidity used to *pass* the minimum (`nan < 12000` is
+False), and one malformed holder count used to break a whole 20-token FOMO batch.
+
+Each cycle's scan result now carries `stats.evidence`: for every screen reason the count
+and up to five examples, each with the token's chain and full address, the source and
+source field (`fomo.liquidity`), the sanitized raw value, the parsed value and parse
+status, the threshold, `fetched_at_local` (this machine's clock when the FOMO batch came
+back) and `provider_timestamp` (a timestamp field FOMO sent for the row, as received, or
+null). It is journaled with the scan, so reading it needs no external call:
+`python crosscheck.py evidence runs/<run_id>/journal.jsonl`.
+
+`python crosscheck.py liquidity runs/<run_id>/journal.jsonl` compares FOMO's liquidity
+with DexScreener's for at most five liquidity-rejected tokens, same chain and full
+address. It lists every DexScreener pair with its own `liquidity.usd`, marks the one the
+desk would select (the deepest on the token's chain), never adds pools together, and
+reports `no_pairs`, `no_pairs_on_chain` and `liquidity_missing` separately. It is
+read-only and outside the trading loop; neither provider's value replaces the other's.
 
 ## The paper engine
 

@@ -14,9 +14,9 @@ def test_free_kill_passes_a_clean_token():
 
 def test_free_kill_never_lets_null_pass():
     assert free_kill(tok(age_minutes=None)) == "age_missing"
-    assert free_kill(tok(liquidity_usd=None)) == "liquidity"
-    assert free_kill(tok(volume_h24=None)) == "volume"
-    assert free_kill(tok(mcap_usd=None)) == "mcap"
+    assert free_kill(tok(liquidity_usd=None)) == "liquidity_missing"
+    assert free_kill(tok(volume_h24=None)) == "volume_missing"
+    assert free_kill(tok(mcap_usd=None)) == "mcap_missing"
 
 
 def test_free_kill_bounds():
@@ -25,8 +25,8 @@ def test_free_kill_bounds():
     assert free_kill(tok(age_minutes=15)) is None                  # the floor is inclusive
     assert free_kill(tok(age_minutes=72 * 60)) is None             # so is the ceiling
     assert free_kill(tok(age_minutes=73 * 60)) == "age_too_old"
-    assert free_kill(tok(mcap_usd=9_000_000)) == "mcap"
-    assert free_kill(tok(liquidity_usd=11_999)) == "liquidity"
+    assert free_kill(tok(mcap_usd=9_000_000)) == "mcap_above_max"
+    assert free_kill(tok(liquidity_usd=11_999)) == "liquidity_below_min"
 
 
 def test_trade_kill():

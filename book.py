@@ -36,6 +36,10 @@ BENCH_MINUTES = {
     "shape": 25, "shape_weak": 25, "momentum_already_spent": 25,
     "liquidity_fits_ticket": 25, "liquidity": 25, "volume": 25,
     "trades": 25, "mcap": 25, "dossier_failed": 30,
+    # the screened metrics, split by cause; same 25 minutes as the old single reasons
+    "liquidity_missing": 25, "liquidity_invalid": 25, "liquidity_below_min": 25,
+    "volume_missing": 25, "volume_invalid": 25, "volume_below_min": 25,
+    "mcap_missing": 25, "mcap_invalid": 25, "mcap_below_min": 25, "mcap_above_max": 25,
     # age: a token only gets older. Too old is final; too young is never benched (it is
     # watched until it matures, see watchlist.py); missing may be filled in later.
     "age_too_old": 100_000, "age_missing": 20, "age_too_young": 0,

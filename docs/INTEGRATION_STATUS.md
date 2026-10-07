@@ -24,6 +24,40 @@ journal replay matched `paper.db` exactly, but with no orders it exercised none 
 order lifecycle. Cause: discovery starvation, not the thresholds (see the README,
 "Discovery and the watchlist"). The thresholds were left unchanged.
 
+## Liquidity rejections (operator-reported, cause not yet established)
+
+After the watchlist change, later scans had 40, 74 and 110 tokens in the eligible age
+range, with 39, 31 and 75 liquidity rejections. No candidate reached Jev and no order was
+placed; replay matched every ledger row. Whether those rejections reflect thin pools,
+FOMO reporting something other than pool liquidity, or bad data is **not known yet**.
+Those runs predate the split reasons and evidence, so their journals cannot say.
+
+Collect it locally (Windows PowerShell, from the repository root):
+
+```powershell
+# 1. A short paper run that records the new evidence. Paper only; same setup as before
+#    (judge running, $env:JUDGE_URL / $env:DESK_SECRET set, Chrome logged into FOMO).
+python main.py --nets solana --max-polls 6 --starting-cash 10000
+
+# 2. The newest run directory
+$run = (Get-ChildItem runs -Directory | Sort-Object Name | Select-Object -Last 1).FullName
+
+# 3. What the screen saw: reason counts and up to five raw/parsed examples per reason
+python crosscheck.py evidence "$run\journal.jsonl"
+
+# 4. FOMO vs DexScreener liquidity for up to five liquidity-rejected tokens (read-only)
+python crosscheck.py liquidity "$run\journal.jsonl" --json "$run\crosscheck.json"
+
+# 4b. Same, but re-fetch FOMO now as well (needs the logged-in Chrome)
+$env:CHROME_CDP = "http://127.0.0.1:9222"
+python crosscheck.py liquidity "$run\journal.jsonl" --fomo --json "$run\crosscheck-fomo.json"
+
+# 5. Replay still matches the ledger
+python replay.py --compare $run
+```
+
+`crosscheck.py` exits 2 if DexScreener is BLOCKED or errors; this sandbox gets BLOCKED.
+
 ## Last diagnostic: Claude Code cloud sandbox, 2026-10-07 (Solana only)
 
 | service | status | why |

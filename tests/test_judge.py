@@ -39,11 +39,29 @@ def handler(request):
 def api(monkeypatch):
     seen.clear()
     judge._client = None
+    # judge.DESK_SECRET was read from the environment at import. Pin it, so the tests do
+    # not depend on whatever DESK_SECRET the shell running pytest happens to export.
+    monkeypatch.setattr(judge, "DESK_SECRET", "test-secret")
     monkeypatch.setattr(judge, "AsyncTypeSafeClient", lambda: AsyncTypeSafeClient(
         api_key="ts-test", transport=httpx2.MockTransport(handler)))
     with TestClient(judge.app) as c:
         yield c
     judge._client = None
+
+
+def test_judge_tests_pass_with_a_different_shell_secret(tmp_path):
+    """regression: with DESK_SECRET exported to anything else, every authorised request
+       here used to get 401"""
+    import os
+    import subprocess
+    import sys
+    from tests.conftest import ROOT
+    env = {**os.environ, "DESK_SECRET": "a-different-shell-secret",
+           "DESK_DB": str(tmp_path / "d.db")}
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                        "tests/test_judge.py", "-k", "not different_shell_secret"],
+                       cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout[-2000:]
 
 
 def test_bad_secret(api):

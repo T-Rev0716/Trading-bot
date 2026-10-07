@@ -17,8 +17,12 @@ import os
 import sys
 import time
 
+import math
+
 import requests
 import websocket                                # pip install websocket-client
+
+from values import parse_metric, raw_for_record
 
 API    = os.environ.get("FOMO_API", "https://prod-api.fomo.family")
 ORIGIN = "https://fomo.family"
@@ -29,6 +33,8 @@ SOLANA = 1399811149
 BATCH  = 20
 
 # seconds -> FOMO field. The desk keys `change` by window length.
+# desk metric -> FOMO field, parsed strictly (values.parse_metric)
+METRIC_FIELDS = {"mcap": "marketCap", "liq": "liquidity", "vol24": "volume24"}
 CHANGE_FIELDS = {300: "change5m", 3600: "change1", 14400: "change4",
                  43200: "change12", 86400: "change24"}
 
@@ -47,12 +53,14 @@ def _jwt_exp(tok: str) -> float:
 
 
 def _num(v):
-    if v is None or v == "":
+    """Lenient parse for price and change fields: None unless a finite number."""
+    if v is None or v == "" or isinstance(v, bool):
         return None
     try:
-        return float(v)
+        f = float(v)
     except (TypeError, ValueError):
         return None
+    return f if math.isfinite(f) else None
 
 
 def _key(addr: str, net) -> str:
@@ -140,10 +148,12 @@ class Fomo:
         want = {_key(*i.split(":")): i for i in ids}
         out = {}
         for n in range(0, len(ids), BATCH):
-            for r in _results(self.filter_tokens(ids[n:n + BATCH])):
+            payload = self.filter_tokens(ids[n:n + BATCH])
+            fetched = time.time()                       # local clock, not FOMO's
+            for r in _results(payload):
                 row = _row(r)
                 if row and (tid := want.get(_key(row["address"], row["net"]))):
-                    out[tid] = row
+                    out[tid] = {**row, "fetched_at": fetched}
         return out
 
 
@@ -169,16 +179,37 @@ def _row(r: dict):
     net = tok.get("networkId") or r.get("networkId")
     if not addr or net is None:
         return None
-    holders = r.get("holders")
+    metrics = {}
+    for key, field in METRIC_FIELDS.items():
+        m = parse_metric(r.get(field))
+        metrics[key] = {"source": "fomo", "source_field": field,
+                        "raw": raw_for_record(r.get(field)), "status": m.status,
+                        "invalid_kind": m.kind, "value": m.value}
+    h = parse_metric(r.get("holders"))
+    holders = int(h.value) if h.status == "ok" and h.value == int(h.value) else None
     return {"address": addr, "net": int(net),
             "symbol": tok.get("symbol") or r.get("symbol") or "?",
-            "mcap": _num(r.get("marketCap")),
-            "liq": _num(r.get("liquidity")),
-            "vol24": _num(r.get("volume24")),
+            "mcap": metrics["mcap"]["value"],
+            "liq": metrics["liq"]["value"],
+            "vol24": metrics["vol24"]["value"],
             "price": _num(r.get("priceUSD")),
-            "holders": int(holders) if holders not in (None, "") else None,
+            "holders": holders,
             "change": {s: _num(r.get(f)) for s, f in CHANGE_FIELDS.items()},
-            "created": r.get("createdAt") or tok.get("createdAt")}
+            "created": r.get("createdAt") or tok.get("createdAt"),
+            "created_field": "createdAt",
+            "metrics": metrics,
+            "provider_timestamp": _provider_ts(r)}
+
+
+# a timestamp FOMO itself reports for the row, if any; reported as-is, never interpreted
+PROVIDER_TS_FIELDS = ("timestamp", "updatedAt", "lastUpdated", "lastTransaction")
+
+
+def _provider_ts(r: dict):
+    for f in PROVIDER_TS_FIELDS:
+        if r.get(f) is not None:
+            return {"field": f, "value": raw_for_record(r.get(f))}
+    return None
 
 
 if __name__ == "__main__":

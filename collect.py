@@ -12,6 +12,7 @@ import requests
 
 from fomo_api import Fomo
 from ids import CHAIN_NAME, token_key
+from values import raw_for_record
 
 GT  = "https://api.geckoterminal.com/api/v2"
 DEX = "https://api.dexscreener.com/latest/dex/tokens"
@@ -109,7 +110,33 @@ def normalise(tid: str, m: dict, now: float | None = None) -> dict:
                        "4h": m["change"].get(14400), "12h": m["change"].get(43200),
                        "24h": m["change"].get(86400)},
             "created_at": created_epoch(m["created"]),
-            "age_minutes": age_minutes(m["created"], now)}
+            "age_minutes": age_minutes(m["created"], now),
+            # where each screened number came from, for rejection evidence
+            "data_quality": _quality(m),
+            "fetched_at_local": m.get("fetched_at"),
+            "provider_timestamp": m.get("provider_timestamp")}
+
+
+DESK_METRIC = {"liq": "liquidity_usd", "vol24": "volume_h24", "mcap": "mcap_usd"}
+
+
+def _quality(m: dict) -> dict:
+    """Per screened field: source, source field, raw value and parse status. Rows built
+       without metrics (older callers, tests) get a status derived from the value."""
+    q = {}
+    for k, field in DESK_METRIC.items():
+        info = (m.get("metrics") or {}).get(k)
+        if info is None:
+            v = m.get(k)
+            info = {"source": "fomo", "source_field": None, "raw": v,
+                    "status": "missing" if v is None else "ok", "invalid_kind": None}
+        q[field] = {x: info.get(x) for x in ("source", "source_field", "raw", "status",
+                                             "invalid_kind")}
+    q["age_minutes"] = {"source": "fomo", "source_field": m.get("created_field"),
+                        "raw": raw_for_record(m.get("created")),
+                        "status": "missing" if created_epoch(m.get("created")) is None
+                        else "ok", "invalid_kind": None}
+    return q
 
 
 def shortlist(fomo: Fomo, ids: list[str], now: float | None = None) -> list[dict]:

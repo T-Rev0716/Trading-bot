@@ -2,11 +2,34 @@
 
 Facts kill before judgements do. A null never passes a hard check: missing is missing.
 """
+import math
+
 from thresholds import HARD, SOFT, SHAPE_MIN_CROWD
 
+# screened metric -> (reason prefix, threshold keys)
+METRICS = {"liquidity_usd": ("liquidity", "min_liquidity_usd", None),
+           "volume_h24": ("volume", "min_volume_h24", None),
+           "mcap_usd": ("mcap", "min_mcap_usd", "max_mcap_usd")}
 
-def _below(v, floor) -> bool:
-    return v is None or v < floor
+
+def metric_kill(t, field) -> str | None:
+    """missing, invalid (NaN, infinite, negative, malformed) or out of range, kept apart.
+       Zero is an observed value: it fails a minimum as below_min, never as missing."""
+    name, lo, hi = METRICS[field]
+    status = ((t.get("data_quality") or {}).get(field) or {}).get("status")
+    v = t[field]
+    if status == "invalid":
+        return f"{name}_invalid"
+    if v is None:
+        return f"{name}_missing"
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) \
+            or v < 0:
+        return f"{name}_invalid"             # defensive: a bad number that skipped parsing
+    if v < HARD[lo]:
+        return f"{name}_below_min"
+    if hi and v > HARD[hi]:
+        return f"{name}_above_max"
+    return None
 
 
 def age_band(age) -> str:
@@ -27,11 +50,9 @@ def free_kill(t) -> str | None:
     band = age_band(t["age_minutes"])
     if band != "in_range":
         return f"age_{band}"
-    if _below(t["liquidity_usd"], HARD["min_liquidity_usd"]):    return "liquidity"
-    if _below(t["volume_h24"], HARD["min_volume_h24"]):          return "volume"
-    m = t["mcap_usd"]
-    if m is None or not HARD["min_mcap_usd"] <= m <= HARD["max_mcap_usd"]:
-        return "mcap"
+    for field in METRICS:                     # same order as before: liquidity, volume, mcap
+        if (k := metric_kill(t, field)):
+            return k
     return None
 
 
