@@ -1,24 +1,23 @@
-"""Replay a recorded tape through the strategy and the rules-only baseline. Deterministic:
-the same tape and the same thresholds give the same report, every time.
+"""Exact replay of a recorded paper run.
 
-    python replay.py paper_tape.jsonl
+    python replay.py runs/<run_id>/journal.jsonl
 
-The tape is written by the paper shift (main.py): every cycle's candidates with their
-recorded judge answers, the pick response, and every quote the engines used. Retune
-thresholds.py and replay to see what the change would have done, without a judge call.
+Rebuilds empty ledgers, then walks the journal in sequence order. Polls and cycles run
+the same code as the live run (session.py); every quote attempt, broker submit and
+lookup, scan result and pick is answered with the next recorded answer, and every
+decision and equity mark is checked against the record. Nothing is looked up by time,
+so no decision can see a quote taken after it. The first difference raises
+ReplayDivergence with the sequence number where it happened.
 
-Limits: a candidate whose answers were never recorded cannot be judged in replay, and a
-token that was never quoted cannot be entered or marked.
+This is a fidelity check, not a what-if tool: a changed threshold is refused up front.
 """
-import itertools
 import json
 import sys
-from itertools import groupby
 
-from cycle import enter
-from market import Quote, ReplayMarket
+import session
+from journal import ReplayDivergence, ReplayJournal, plain
+from judge_client import JudgeMalformed
 from paper import build
-from pick import PickUnavailable
 from report import compare, metrics
 
 
@@ -27,39 +26,48 @@ def load(path: str) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def recorded_judge(cycle_event: dict):
-    def judge(question_set, state):
-        rec = cycle_event.get("pick")
-        labels = [c["label"] for c in state["candidates"]]
-        if question_set != "pick" or not rec or rec["labels"] != labels:
-            raise PickUnavailable("this candidate set was not judged in the recording")
-        return rec["response"]
-    return judge
+def _check_config(ev: dict):
+    want, have = ev["config"], plain(session.config_snapshot())
+    if want != have:
+        diff = sorted(k for k in set(want) | set(have) if want.get(k) != have.get(k))
+        raise ReplayDivergence(f"seq {ev['seq']}: thresholds.py differs from the recording "
+                               f"in {diff}. Replay is exact; restore them to replay.")
+    if ev["version"] != session.JOURNAL_VERSION:
+        raise ReplayDivergence(f"journal version {ev['version']}, replay knows "
+                               f"{session.JOURNAL_VERSION}")
 
 
-def run(events: list[dict], *, faults=None) -> dict:
-    now = [0.0]
-    ids = itertools.count(1)
-    market = ReplayMarket()
-    engines = build(":memory:", market, clock=lambda: now[0], faults=faults,
-                    new_id=lambda: f"id{next(ids):06d}")
-    log = []
-    order = {"quote": 0, "cycle": 1}
-    ordered = sorted(enumerate(events), key=lambda ie: (ie[1]["ts"], order[ie[1]["type"]], ie[0]))
-    for ts, group in groupby((e for _, e in ordered), key=lambda e: e["ts"]):
-        now[0] = ts
-        group = list(group)
-        for e in group:
-            if e["type"] == "quote":
-                market.update(e["token_key"], Quote(**e["quote"]))
-        for eng in engines.values():
-            eng.tick()
-        for e in group:
-            if e["type"] == "cycle":
-                cands = [(c["d"], c.get("answers")) for c in e["candidates"]]
-                log.append({"ts": ts, **enter(cands, recorded_judge(e), engines,
-                                              e["cycle_id"])})
-    return {"metrics": [metrics(e.ledger) for e in engines.values()], "log": log}
+def _no_live_call(*a, **k):
+    raise ReplayDivergence("replay tried to reach a live service")
+
+
+def run(events: list[dict], db_path: str = ":memory:") -> dict:
+    rj = ReplayJournal(events)
+    head = rj.peek()
+    if not head or head["kind"] != "session":
+        raise ReplayDivergence("journal does not start with a session event")
+    _check_config(head)
+    clock = session.SessionClock(head["t0"])
+    engines = build(db_path, None, clock=clock, names=list(head["ledgers"]), journal=rj,
+                    starting_cash=head["ledgers"], replay=True)
+    session.start(engines, rj, clock)
+
+    while not rj.done():
+        ev = rj.peek()
+        if ev["kind"] == "poll":
+            session.poll(engines, rj, clock, ev["ts"])
+        elif ev["kind"] == "cycle":
+            try:
+                session.cycle(engines, rj, clock, ev["ts"], _no_live_call, _no_live_call)
+            except JudgeMalformed:
+                pass                     # the recorded run stopped here too
+        elif ev["kind"] == "resume":
+            _check_config(ev)
+            clock.set(ev["t0"])
+            session.start(engines, rj, clock, resumed=True)
+        else:
+            raise ReplayDivergence(f"seq {ev['seq']}: {ev['kind']} outside a poll or cycle")
+    return {"engines": engines, "metrics": [metrics(e.ledger) for e in engines.values()]}
 
 
 if __name__ == "__main__":
@@ -67,4 +75,5 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(2)
     result = run(load(sys.argv[1]))
+    print(f"replayed {len(load(sys.argv[1]))} events with no divergence\n")
     print(compare(result["metrics"]))

@@ -58,8 +58,9 @@ BASELINE = {
 
 # Paper engine. Live execution is disabled: these are the only fills there are.
 PAPER = {
-    # Paper bank. At the guide's $1,500 no ticket clears the fee limit: 6% of 1,500 is
-    # $90, and a $0.95 floor is 1% only from $95 up. The desk could never trade.
+    # Default paper bank; override with --starting-cash or PAPER_STARTING_CASH. At the
+    # guide's $1,500 no ticket clears the fee limit (6% of 1,500 is $90, and a $0.95
+    # floor is 1% only from $95 up), so that bank never trades. See scenarios.py.
     "starting_cash_usd": 10_000.0,
     "fee_rate": 0.0045,         # FOMO fee, per side
     "min_fee_usd": 0.95,        # FOMO fee floor, per side
@@ -67,12 +68,15 @@ PAPER = {
     # product pool, 1% of total liquidity is 2% of one reserve, roughly 200 bps.
     "base_slippage_bps": 50,
     "impact_bps_per_pct_of_pool": 200,
-    "max_slippage_bps": 500,    # over this the fill completes and is flagged
+    "max_slippage_bps": 500,    # entries expected over this are rejected; exits complete
+                                # and are flagged
 }
 
 SIZING = {
-    "kelly_fraction": 0.03,     # PLACEHOLDER: there is no measured edge yet. Set it from
-                                # the paper results, not from a feeling.
+    # A FIXED PLACEHOLDER, not a Kelly allocation and not an estimate of anything. No edge
+    # has been measured, so there is nothing to compute a Kelly fraction from. Every
+    # ticket is this share of free cash, before the cuts and caps below.
+    "fixed_ticket_fraction": 0.03,
     "max_ticket_fraction": 0.06,  # of free cash. Free cash only, never the locked bag
     "max_pool_share": 0.02,     # more than 2% of the pool and you are the exit
     "max_fee_rate": 0.01,       # one side's fee over 1% of the ticket: do not trade
@@ -81,7 +85,8 @@ SIZING = {
 EXITS = {
     "min_volume_ratio": 0.20,   # volume_h6 / (volume_h24 / 4) under this: close
     "quote_retries": 2,         # a failed quote is retried twice, then the position closes
-    "stale_quote_haircut": 0.25,  # closing blind is priced at last price * (1 - this)
+    "stale_quote_haircut": 0.25,  # ASSUMPTION: a blind close is valued at last price *
+                                  # (1 - this). Reported separately, with a 0% stress.
     "stop_loss": None,          # e.g. 0.30 closes at -30%. None: rule off
     "take_profit": None,        # e.g. 1.00 closes at +100%. None: rule off
     "max_hold_minutes": None,   # None: rule off

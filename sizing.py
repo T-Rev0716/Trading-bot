@@ -12,7 +12,8 @@ def ticket(free_cash: float, size_factor: float, liquidity_usd, *, cfg=SIZING,
            paper=PAPER) -> tuple[float, str | None]:
     """(dollars, None) or (0.0, reason). Dollars are spent on tokens; the fee comes on top.
 
-    1. kelly_fraction * free cash, clamped at max_ticket_fraction. Free cash only.
+    1. fixed_ticket_fraction * free cash, clamped at max_ticket_fraction. Free cash
+       only. The fraction is a fixed placeholder, not an estimated Kelly allocation.
     2. times size_factor (the missing-data cuts, stacked).
     3. at most max_pool_share of the pool. Bigger and you are the exit.
     4. zero if one side's fee is over max_fee_rate of the ticket, or cash cannot cover it.
@@ -23,7 +24,7 @@ def ticket(free_cash: float, size_factor: float, liquidity_usd, *, cfg=SIZING,
         return 0.0, "no_liquidity"
     if not 0 < size_factor <= 1:
         return 0.0, "size_factor_zero"
-    t = min(cfg["kelly_fraction"], cfg["max_ticket_fraction"]) * free_cash
+    t = min(cfg["fixed_ticket_fraction"], cfg["max_ticket_fraction"]) * free_cash
     t *= size_factor
     t = min(t, liquidity_usd * cfg["max_pool_share"])
     t = math.floor(t * 100) / 100                       # whole cents, rounded down

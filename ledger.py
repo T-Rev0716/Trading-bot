@@ -4,14 +4,18 @@ Order lifecycle
     NEW -> SUBMITTED -> FILLED | REJECTED | UNKNOWN
     UNKNOWN -> FILLED | REJECTED          only through reconciliation
 
+Ids are derived, not drawn: an order's id is a hash of its idempotency key and a
+position's id is "p-" + the id of the buy that opened it. The same run gives the same
+ids, which is what lets a replay be compared row for row.
+
 UNKNOWN means the venue did not acknowledge. It is never read as failure: the cash a buy
 reserved stays reserved, a closing position stays CLOSING, and the ledger refuses every
 new order until reconciliation settles what happened.
 """
+import hashlib
 import json
 import sqlite3
 import time
-import uuid
 
 from thresholds import PAPER
 
@@ -67,14 +71,28 @@ def connect(path: str) -> sqlite3.Connection:
     return db
 
 
+def order_id_for(idem_key: str) -> str:
+    return "o-" + hashlib.sha256(idem_key.encode()).hexdigest()[:20]
+
+
 class Ledger:
     def __init__(self, db: sqlite3.Connection, name: str, *, starting_cash=None,
-                 clock=time.time, new_id=lambda: uuid.uuid4().hex):
-        self.db, self.name, self.clock, self.new_id = db, name, clock, new_id
-        start = PAPER["starting_cash_usd"] if starting_cash is None else starting_cash
-        with self.db:
-            self.db.execute("INSERT OR IGNORE INTO accounts VALUES (?,?,?,?)",
-                            (name, start, start, clock()))
+                 clock=time.time):
+        """starting_cash only applies when the ledger is first created. Passing a
+           different amount for an existing ledger is refused, never silently mixed."""
+        self.db, self.name, self.clock = db, name, clock
+        row = db.execute("SELECT starting_cash FROM accounts WHERE ledger=?",
+                         (name,)).fetchone()
+        if row is None:
+            start = PAPER["starting_cash_usd"] if starting_cash is None else starting_cash
+            if start <= 0:
+                raise LedgerError("starting cash must be positive")
+            with self.db:
+                self.db.execute("INSERT INTO accounts VALUES (?,?,?,?)",
+                                (name, float(start), float(start), clock()))
+        elif starting_cash is not None and float(starting_cash) != row[0]:
+            raise LedgerError(f"ledger {name} was opened with ${row[0]:,.2f}, not "
+                              f"${starting_cash:,.2f}. Start a new run directory.")
 
     # ---- reads ------------------------------------------------------------------------
     def cash(self) -> float:
@@ -148,7 +166,7 @@ class Ledger:
             if p["token_key"] != token_key:
                 raise LedgerError("sell token does not match its position")
             qty = p["qty"]
-        oid, now = self.new_id(), self.clock()
+        oid, now = order_id_for(idem_key), self.clock()
         try:
             with self.db:
                 self.db.execute(
@@ -209,14 +227,18 @@ class Ledger:
                 spend = fill.notional_usd + fill.fee_usd
                 self.db.execute("UPDATE accounts SET cash = cash - ? WHERE ledger=?",
                                 (spend, self.name))
-                pid = self.new_id()
+                pid = "p-" + oid
+                # the pool depth the order was priced against: a position that only
+                # appears through reconciliation still has something to close against
+                liq = json.loads(o["meta"] or "{}").get("ref_liquidity")
                 self.db.execute(
                     "INSERT INTO positions (position_id, ledger, token_key, ticker, status, "
                     "entry_order_id, qty, entry_price, entry_notional, entry_fee, opened_at, "
-                    "last_price, last_mark_at, meta) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "last_price, last_liquidity, last_mark_at, meta) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (pid, self.name, o["token_key"], o["ticker"], "OPEN", oid, fill.qty,
                      fill.price, fill.notional_usd, fill.fee_usd, self.clock(), fill.price,
-                     self.clock(), o["meta"]))
+                     liq, self.clock(), o["meta"]))
                 return self.position(pid)
             self.db.execute("UPDATE accounts SET cash = cash + ? WHERE ledger=?",
                             (fill.notional_usd - fill.fee_usd, self.name))

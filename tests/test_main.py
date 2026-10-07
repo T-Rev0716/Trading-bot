@@ -1,4 +1,3 @@
-import json
 import subprocess
 import sys
 
@@ -6,6 +5,8 @@ import pytest
 
 import book
 import main
+import session
+from journal import RecordJournal
 from tests.conftest import ROOT
 from tests.helpers import answers, dossier, engines, quote
 from venue import FaultPlan
@@ -64,23 +65,31 @@ def judge_for(calls):
     return judge
 
 
-def test_cycle_enters_both_ledgers_and_writes_the_tape(wired, tmp_path):
+def run_cycle(eng, clock, judge, journal=None, ts=None):
+    journal = journal or RecordJournal()
+    scan_fn = lambda ask, free: main.scan(Fomo(), judge, Desk(), free, ask)
+    return session.cycle(eng, journal, session.SessionClock(clock()), ts or clock(),
+                         scan_fn, judge), journal
+
+
+def test_cycle_enters_both_ledgers_and_journals_it(wired):
     eng, market, clock = engines()
     for d in (A, B):
         market.update(d["token_key"], quote())
-    calls, tape = [], tmp_path / "tape.jsonl"
-    out = main.run_cycle(Fomo(), judge_for(calls), Desk(), eng, str(tape), now=clock())
+    calls = []
+    out, j = run_cycle(eng, clock, judge_for(calls))
     assert out["strategy"]["entry"]["status"] == "FILLED"
     assert out["baseline"]["entry"]["status"] == "FILLED"
     assert out["baseline"]["choice"] == f"AAA ({B['token_key']})"     # higher buy share
     assert calls.count("market") == 2 and calls.count("pick") == 1
-    row = json.loads(tape.read_text().splitlines()[0])
-    assert row["type"] == "cycle" and len(row["candidates"]) == 2
-    assert row["pick"]["labels"] == [f"AAA ({A['token_key']})", f"AAA ({B['token_key']})"]
+    kinds = [e["kind"] for e in j.events]
+    assert kinds[:2] == ["cycle", "candidates"] and kinds[-1] == "entries"
+    pick = next(e for e in j.events if e["kind"] == "judge")
+    assert pick["request"]["labels"] == [f"AAA ({A['token_key']})", f"AAA ({B['token_key']})"]
     # both ledgers hold: the next cycle does not scan at all
     calls.clear()
-    out = main.run_cycle(Fomo(), judge_for(calls), Desk(), eng, str(tape), now=clock())
-    assert out == {"skipped": {"strategy": "position_open", "baseline": "position_open"}}
+    out, _ = run_cycle(eng, clock, judge_for(calls))
+    assert out["skipped"] == {"strategy": "position_open", "baseline": "position_open"}
     assert calls == []
 
 
@@ -89,13 +98,13 @@ def test_unknown_order_blocks_the_strategy_but_not_the_baseline(wired):
     for d in (A, B):
         market.update(d["token_key"], quote())
     calls = []
-    out = main.run_cycle(Fomo(), judge_for(calls), Desk(), eng, now=clock())
+    out, _ = run_cycle(eng, clock, judge_for(calls))
     assert out["strategy"]["entry"]["status"] == "UNKNOWN"
     assert out["baseline"]["entry"]["status"] == "FILLED"
     eng["baseline"].ledger.db.execute("DELETE FROM positions WHERE ledger='baseline'")
     book.DB.execute("DELETE FROM bench_v2")
     calls.clear()
-    out = main.run_cycle(Fomo(), judge_for(calls), Desk(), eng, now=clock() + 900)
+    out, _ = run_cycle(eng, clock, judge_for(calls), ts=clock() + 900)
     assert out["blocked"]["strategy"] == "unknown_order"
     assert calls == []                                    # no judge spend while blocked
     assert "strategy" not in out                          # no strategy entry attempted
@@ -103,6 +112,7 @@ def test_unknown_order_blocks_the_strategy_but_not_the_baseline(wired):
 
 def test_judge_rejection_benches_for_the_strategy_only(wired):
     eng, market, clock = engines()
+
     def judge(qs, state):
         r = judge_for([])(qs, state)
         if qs == "market":
@@ -110,10 +120,21 @@ def test_judge_rejection_benches_for_the_strategy_only(wired):
         return r
     market.update(A["token_key"], quote())
     market.update(B["token_key"], quote())
-    out = main.run_cycle(Fomo(), judge, Desk(), eng, now=clock())
+    out, _ = run_cycle(eng, clock, judge)
     assert out["stats"]["soft"] == {"momentum_already_spent": 2}
     assert book.benched(A["tid"]) == "strategy"
     assert out["baseline"]["entry"]["status"] == "FILLED"
+
+
+def test_a_failed_scan_stands_the_cycle_down_and_is_journaled(wired):
+    eng, market, clock = engines()
+    j = RecordJournal()
+
+    def boom(ask, free):
+        raise ConnectionError("fomo down")
+    out = session.cycle(eng, j, session.SessionClock(clock()), clock(), boom, judge_for([]))
+    assert out["error"] == "RecordedError: ConnectionError: fomo down"
+    assert [e["kind"] for e in j.events] == ["cycle", "candidates", "cycle_error"]
 
 
 def test_live_flag_is_refused(tmp_path):

@@ -39,12 +39,16 @@ same sizing and the same exits:
 | `cycle.py`        | entries for one cycle, shared by the shift and replay             |
 | `sizing.py`       | SIZE, enforced in Python                                          |
 | `exits.py`        | RISK, enforced in Python                                          |
-| `venue.py`        | the simulated venue: deterministic fills, fees, slippage, faults  |
+| `broker.py`       | the broker interface: `submit` and `lookup`                       |
+| `venue.py`        | `PaperVenue`, the only broker: deterministic fills, fees, slippage, faults |
 | `ledger.py`       | cash, orders, positions, marks; the order lifecycle               |
-| `paper.py`        | the engine tying ledger, venue and market together                |
-| `market.py`       | quotes: live DexScreener, replay, and a tape recorder             |
-| `report.py`       | performance per ledger, side by side                              |
-| `replay.py`       | re-run a recorded tape through both ledgers                       |
+| `paper.py`        | the engine tying ledger, broker and market together               |
+| `market.py`       | quotes: live DexScreener, and a static market for tests/scenarios |
+| `journal.py`      | the ordered event record, and strict replay of it                 |
+| `session.py`      | poll and cycle, the same code for a live run and a replay         |
+| `report.py`       | performance per ledger: observed, assumed and stress, side by side |
+| `replay.py`       | exact replay of a run's journal, failing on the first divergence  |
+| `scenarios.py`    | SYNTHETIC scenarios, kept apart from any market evidence          |
 | `book.py`         | the bench, scoped shared or strategy-only                         |
 | `desk.py`         | X reads and Telegram reports. No order delivery                   |
 | `main.py`         | the paper shift                                                   |
@@ -67,10 +71,13 @@ cp .env.example .env        # fill it in, then: set -a; . ./.env; set +a
 4. **FOMO session:** start Chrome with `--remote-debugging-port=9222
    --user-data-dir="$HOME/.fomo-chrome"`, log into fomo.family, then check the parser:
    `python fomo_api.py probe <address>:1399811149`.
-5. **Run on paper:** `python main.py --once`, then `python main.py`. It polls every 5
-   minutes and scans every 15.
-6. **Read it:** `python report.py` for both ledgers. `python replay.py paper_tape.jsonl`
-   re-runs the recorded tape (useful after retuning `thresholds.py`).
+5. **Run on paper:** `python main.py --once`, then `python main.py`. Each run gets its
+   own `runs/<run_id>/` with `paper.db` and `journal.jsonl`. It polls every 5 minutes
+   and scans every 15. `--starting-cash 1500` (or `PAPER_STARTING_CASH`) sets the paper
+   bank for a new run; `--resume runs/<run_id>` continues one after a crash.
+6. **Read it:** `python report.py runs/<run_id>` for both ledgers.
+   `python replay.py runs/<run_id>/journal.jsonl` replays the run and confirms it
+   reproduces exactly.
 7. **Tests:** `pip install -r requirements-dev.txt && pytest -q`.
 
 ## The paper engine
@@ -85,18 +92,29 @@ sell:  price = ref * (1 - slip);  sells the whole position, fee out of proceeds
 fee    = max(0.45% * notional, $0.95) per side
 ```
 
-Slippage over `max_slippage_bps` completes and is flagged `slippage_over_max`, as FILLS
-specifies. No price or no liquidity: the venue rejects.
+An **entry** whose expected slippage is over `max_slippage_bps` is rejected: the engine
+checks before sending (`slippage_over_max`, nothing reaches the venue) and the venue
+refuses one anyway. An **exit** over the maximum completes and is flagged, because a
+close is not optional. No price or no liquidity: the venue rejects.
 
-**Sizing** (`sizing.ticket`), the four SIZE steps: `kelly_fraction` of free cash, clamped
-at 6%; times the size factor; at most 2% of the pool; zero if one side's fee is over 1%
-of the ticket. Free cash is the ledger's cash minus whatever unsettled buys reserved.
-`kelly_fraction` is a **placeholder (3%)**: there is no measured edge yet.
+**Sizing** (`sizing.ticket`), the four SIZE steps: `fixed_ticket_fraction` of free cash,
+clamped at 6%; times the size factor; at most 2% of the pool; zero if one side's fee is
+over 1% of the ticket. Free cash is the ledger's cash minus whatever unsettled buys
+reserved. **The 3% is a fixed placeholder, not a Kelly allocation**: Kelly needs a
+measured edge and there is none, so nothing is being estimated. Change it only on the
+strength of paper results.
+
+**Starting cash** is set per run (`--starting-cash`, `PAPER_STARTING_CASH`, default
+$10,000) and fixed for that run's life; reopening a ledger with a different amount is
+refused. At $1,500 nothing trades: 3% is $45, the 6% cap is $90, and the $0.95 fee
+only falls to 1% at $95.
 
 **Exits** (`exits.decide`), polled every 5 minutes:
 - `volume_h6 / (volume_h24 / 4) < 0.20` closes.
-- No quote after two retries closes **blind**, priced at the last price minus a 25%
-  haircut, so missing data never flatters the paper results.
+- No quote after two retries closes **blind**. Its value (last price minus a 25%
+  haircut) is an **assumption**, not an observation, and the report keeps it apart:
+  `realized_pnl_observed` vs `realized_pnl_assumed`, plus a **zero-recovery stress**
+  that values every blind close and every open position at $0, as if unsellable.
 - Missing or zero volume closes: a position you cannot measure is one you do not hold.
 - Optional stop-loss, take-profit and max hold, all off by default.
 
@@ -107,9 +125,10 @@ NEW -> SUBMITTED -> FILLED | REJECTED | UNKNOWN
 UNKNOWN -> FILLED | REJECTED     only through reconciliation against the venue's record
 ```
 
-- Every order has a unique id and a unique idempotency key
-  (`ledger:buy:chain:address:cycle` or `ledger:sell:position:attempt`). A repeat is
-  refused. The venue never fills the same order id twice.
+- Every order has a unique idempotency key (`ledger:buy:chain:address:cycle` or
+  `ledger:sell:position:attempt`) and an id derived from it; a position's id is derived
+  from the buy that opened it. A repeat is refused. The venue never fills the same order
+  id twice. Derived ids are what let a replay be compared row for row.
 - A delivery timeout is **UNKNOWN, never failed**. The buy's cash stays reserved, a
   closing position stays `CLOSING`, and that ledger refuses every new order until
   reconciliation settles it. The venue saying "never received" only counts after a
@@ -147,22 +166,54 @@ Cuts stack: a dark Robinhood token with no X account trades at 0.5 × 0.8 × 0.6
 **Identity** is `chain:full_address` everywhere (EVM addresses lowercased, Solana kept
 case-sensitive). Pick options read `TICKER (chain:address)`.
 
-## Strategy vs baseline
+## Broker interface
 
-`python replay.py examples/synthetic_tape.jsonl`:
+`broker.Broker` is two calls: `submit(order, ref_price, liquidity, flags) -> Fill` and
+`lookup(order_id) -> (FILLED | REJECTED | NOT_FOUND, ...)`, with `BrokerReject`,
+`DeliveryTimeout` and `LookupUnavailable` as the only ways they fail. **`PaperVenue` is
+the only implementation.** The engine refuses any broker that is not a journaled
+`PaperVenue`, and a test fails if another class in the repository implements both calls.
 
-```
-                     strategy     baseline
-return_pct              0.951       -1.845
-realized_pnl            95.14      -184.48
-closed_trades               1            1
-win_rate                  1.0          0.0
-max_drawdown_pct        0.187        1.858
-```
+## Journal and exact replay
 
-**This proves nothing about edge.** The synthetic tape is rigged by construction (the
-trap token looks better to the rules and worse to the judge) to show the comparison
-machinery working. Real evidence needs weeks of `paper_tape.jsonl` from live data.
+Every run writes `journal.jsonl`: one event per line, numbered in the order it happened.
+
+| event | what |
+|---|---|
+| `session`, `resume` | config snapshot, starting cash, start time |
+| `poll`, `cycle` | an operation and its timestamp (time is frozen per operation) |
+| `quote` | every quote attempt: the quote, or the error |
+| `submit`, `lookup` | every broker call: request, fill, reject, timeout, outage |
+| `candidates`, `judge` | the scan's result, the pick's answer |
+| `reconciled`, `exits`, `entries`, `equity`, `cycle_error` | what the desk decided, and cash and equity after |
+
+`replay.py` rebuilds empty ledgers and runs the **same** poll and cycle code
+(`session.py`) with the journal in place of the outside world: each call is answered with
+the next recorded answer, each decision is compared with the next recorded one. Nothing is
+looked up by time or by token, so a decision cannot see a quote from after it. A changed
+quote, a reordered event, a missing event or a changed threshold stops the replay with
+`ReplayDivergence` and the sequence number. It is a fidelity check, not a what-if tool.
+
+The regression tests record runs with quote outages, a lost-before-receipt entry,
+executed-but-unacknowledged entries and exits, venue lookups that fail, a blind close and
+a crash-resume. Each replay must reproduce the orders, order history, positions,
+balances and equity marks exactly.
+
+## Results
+
+### Market evidence
+
+**None yet.** Nothing here has run against live data. Evidence can only come from paper
+runs on live data: `python main.py`, then `python report.py` and `python replay.py`.
+Even then it is simulated fills, not trading results.
+
+### Synthetic demonstrations (not evidence)
+
+`python scenarios.py` runs invented scenarios at a $1,500 and a $10,000 bank, writes
+`examples/SYNTHETIC_RESULTS.md`, and writes replayable journals to `examples/synthetic/`.
+The scenarios are built to exercise the machinery: the strategy/baseline split (the
+`trap` scenario is **rigged** so the judge looks right), an unsellable token with the
+zero-recovery stress, and a lost acknowledgement. They say nothing about edge.
 
 ## Integration status
 
@@ -170,9 +221,10 @@ machinery working. Real evidence needs weeks of `paper_tape.jsonl` from live dat
 |---|---|---|
 | `typesafe-sdk` 0.7.2 | **verified (offline)** | Package inspected and installed. Every question set goes through the real SDK client against a mocked HTTP endpoint in the tests. |
 | TypeSafe / Jev API | **mocked** | No key here. Never called. Answers in all tests are fabricated. |
-| Paper venue, ledger, sizing, exits, replay, report | **verified** | Built here, deterministic, covered by tests including fault injection. |
+| Paper venue, ledger, sizing, exits, report | **verified** | Built here, deterministic, covered by tests including fault injection. |
+| Journal and exact replay | **verified** | Record-then-replay tests match every table row for row, through outages and lost acknowledgements. Not yet run on a live-data journal. |
 | GeckoTerminal | **mocked** | Blocked from this sandbox. Parsing matches the guide's field names; whether flags come back as booleans or `"yes"`/`"no"` is handled both ways but not observed. |
-| DexScreener | **mocked** | Not reachable here. Used for trade counts and for every paper quote. Robinhood's chainId (`robinhood`) is a guess. |
+| DexScreener | **mocked** | Not reachable here. Used for trade counts and for every paper quote. Robinhood's chainId (`robinhood`) is a guess. In live runs every quote it gives is journaled. |
 | Solana public RPC | **mocked** | Standard JSON-RPC methods; the pool-exclusion logic is tested on fabricated accounts only. |
 | FOMO `/proxy/filterTokens` | **unfinished** | No public docs. The response parser is an assumption (Codex-style rows). Run the probe first. |
 | Privy bearer over Chrome CDP | **unfinished** | Assumes `localStorage['privy:token']`. Untested against a real browser. |
@@ -185,7 +237,7 @@ machinery working. Real evidence needs weeks of `paper_tape.jsonl` from live dat
 - **Paper only.** Orders go to `venue.PaperVenue`. The SIZE/FILLS/RISK prompts are now
   Python (`sizing.py`, `venue.py`, `exits.py`); the prompts are reference only.
 - **The guide's bank cannot trade.** At $1,500, 6% is $90 and the $0.95 fee floor is
-  only 1% from $95. The paper bank defaults to $10,000.
+  only 1% from $95. The paper bank defaults to $10,000 and is configurable per run.
 - **Single survivors** used to skip both the pick gates and the size cuts. Now they go
   through the same checks as everyone else.
 - **Missing data** is a written policy per field and chain, not an implicit pass.

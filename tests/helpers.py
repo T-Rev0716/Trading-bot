@@ -1,8 +1,6 @@
 """Shared fixtures: complete dossiers, passing answers, quotes, engines on a fake clock."""
-import itertools
-
 from ids import token_key
-from market import Quote, ReplayMarket
+from market import Quote, StaticMarket
 from paper import build
 
 T0 = 1_700_000_000.0
@@ -72,12 +70,11 @@ def quote(price=1.0, liq=100_000.0, v6=80_000.0, v24=300_000.0, ts=T0) -> Quote:
     return Quote(price_usd=price, liquidity_usd=liq, volume_h6=v6, volume_h24=v24, ts=ts)
 
 
-def engines(clock=None, faults=None, names=("strategy", "baseline")):
+def engines(clock=None, faults=None, names=("strategy", "baseline"), **kw):
     clock = clock or Clock()
-    ids = itertools.count(1)
-    market = ReplayMarket()
-    return build(":memory:", market, clock=clock, faults=faults, names=names,
-                 new_id=lambda: f"id{next(ids):04d}"), market, clock
+    market = StaticMarket()
+    return build(":memory:", market, clock=clock, faults=faults, names=names, **kw), \
+        market, clock
 
 
 def pick_judge(choose=None, worth=0.9, conf=0.8, calls=None):

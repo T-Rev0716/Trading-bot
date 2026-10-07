@@ -1,6 +1,7 @@
-"""Price and volume quotes for marking paper positions. Data in, never orders out."""
-import json
-from dataclasses import dataclass, asdict
+"""Price and volume quotes for marking paper positions. Data in, never orders out.
+
+Every quote reaches the engine through journal.JournaledMarket, which records it."""
+from dataclasses import dataclass
 
 from ids import split_key
 
@@ -47,31 +48,18 @@ class DexScreenerMarket:
                      ts=self.clock())
 
 
-class ReplayMarket:
-    """Quotes from a recorded tape. A token with no quote at or before now is unavailable."""
+class StaticMarket:
+    """A quote per token, set by the caller: for tests and synthetic scenarios only.
+       Keys in `fail` raise QuoteUnavailable, to simulate an outage."""
 
     def __init__(self):
-        self._last: dict[str, Quote] = {}
-        self.fail: set[str] = set()          # keys whose quotes should fail (tests)
+        self._q: dict[str, Quote] = {}
+        self.fail: set[str] = set()
 
     def update(self, key: str, q: Quote):
-        self._last[key] = q
+        self._q[key] = q
 
     def quote(self, key: str) -> Quote:
-        if key in self.fail or key not in self._last:
+        if key in self.fail or key not in self._q:
             raise QuoteUnavailable(key)
-        return self._last[key]
-
-
-class RecordingMarket:
-    """Wraps a market and appends every successful quote to the tape, for replay."""
-
-    def __init__(self, inner, tape_path: str):
-        self.inner, self.tape_path = inner, tape_path
-
-    def quote(self, key: str) -> Quote:
-        q = self.inner.quote(key)
-        with open(self.tape_path, "a") as f:
-            f.write(json.dumps({"type": "quote", "ts": q.ts, "token_key": key,
-                                "quote": asdict(q)}) + "\n")
-        return q
+        return self._q[key]

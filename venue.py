@@ -5,39 +5,28 @@ so a lost acknowledgement can be reconciled the way it would be against a real v
 by asking what happened to that order id.
 """
 import json
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict, dataclass, field
 
+from broker import BrokerReject, DeliveryTimeout, Fill, LookupUnavailable  # noqa: F401
 from thresholds import PAPER
 
-
-class DeliveryTimeout(RuntimeError):
-    """No acknowledgement. The order may or may not have executed."""
+VenueReject = BrokerReject                   # the name the engine has always used
 
 
-class LookupUnavailable(RuntimeError):
-    """The venue could not be asked. Nothing is known, nothing is assumed."""
-
-
-class VenueReject(RuntimeError):
-    """The venue received the order and refused it. Nothing executed."""
-
-
-@dataclass(frozen=True)
-class Fill:
-    price: float
-    qty: float
-    notional_usd: float       # tokens' value at the fill price
-    fee_usd: float
-    slippage_bps: float
-    flags: tuple = ()
+def slippage_bps(size_usd: float, liquidity_usd: float, cfg=PAPER) -> float:
+    """Expected slippage for a trade of size_usd against a pool of liquidity_usd."""
+    return cfg["base_slippage_bps"] + cfg["impact_bps_per_pct_of_pool"] * (
+        size_usd / liquidity_usd * 100)
 
 
 def simulate_fill(side: str, ref_price, liquidity_usd, *, notional_usd=None, qty=None,
                   cfg=PAPER) -> Fill:
     """Pure function: same inputs, same fill.
 
-       buy:  spends exactly notional_usd on tokens, plus the fee on top.
-       sell: sells exactly qty, the fee comes out of the proceeds."""
+       buy:  spends exactly notional_usd on tokens, plus the fee on top. Rejected when
+             the expected slippage is over max_slippage_bps: an entry is optional.
+       sell: sells exactly qty, the fee comes out of the proceeds. Over the maximum it
+             completes and is flagged: an exit is not optional."""
     if not ref_price or ref_price <= 0:
         raise VenueReject("no_price")
     if not liquidity_usd or liquidity_usd <= 0:
@@ -46,9 +35,11 @@ def simulate_fill(side: str, ref_price, liquidity_usd, *, notional_usd=None, qty
     if not size or size <= 0:
         raise VenueReject("bad_size")
 
-    slip = cfg["base_slippage_bps"] + cfg["impact_bps_per_pct_of_pool"] * (
-        size / liquidity_usd * 100)
-    flags = ("slippage_over_max",) if slip > cfg["max_slippage_bps"] else ()
+    slip = slippage_bps(size, liquidity_usd, cfg)
+    over = slip > cfg["max_slippage_bps"]
+    if over and side == "buy":
+        raise VenueReject("slippage_over_max")
+    flags = ("slippage_over_max",) if over else ()
     if side == "buy":
         price = ref_price * (1 + slip / 10_000)
         q, notional = notional_usd / price, notional_usd
@@ -71,6 +62,8 @@ class FaultPlan:
 
 
 class PaperVenue:
+    """The only Broker implementation. Simulated; nothing leaves the machine."""
+
     def __init__(self, conn, cfg=PAPER, faults: FaultPlan | None = None, clock=None):
         self.db, self.cfg, self.faults, self.clock = conn, cfg, faults or FaultPlan(), clock
         self.submits = self.lookups = 0

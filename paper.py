@@ -7,19 +7,26 @@ import time
 
 import exits
 import sizing
+from broker import BrokerReject, LookupUnavailable
+from journal import JournaledBroker, JournaledMarket, NullJournal
 from ledger import DuplicateOrder, Ledger, OrderBlocked, connect
 from market import QuoteUnavailable
-from thresholds import EXITS, RECONCILE
-from venue import DeliveryTimeout, LookupUnavailable, PaperVenue, VenueReject
+from thresholds import EXITS, PAPER, RECONCILE
+from venue import PaperVenue, slippage_bps
 
 log = logging.getLogger("desk.paper")
 
 
 class PaperEngine:
-    def __init__(self, ledger: Ledger, venue: PaperVenue, market, *, clock=time.time,
-                 exit_cfg=EXITS, reconcile_cfg=RECONCILE):
-        self.ledger, self.venue, self.market, self.clock = ledger, venue, market, clock
-        self.exit_cfg, self.reconcile_cfg = exit_cfg, reconcile_cfg
+    def __init__(self, ledger: Ledger, broker, market, *, clock=time.time,
+                 exit_cfg=EXITS, reconcile_cfg=RECONCILE, paper_cfg=PAPER):
+        """broker must be a JournaledBroker around a PaperVenue (or around nothing, in
+           replay). Live execution is disabled: any other broker is refused here."""
+        if not (isinstance(broker, JournaledBroker) and
+                (broker.inner is None or type(broker.inner) is PaperVenue)):
+            raise RuntimeError("live execution is disabled: PaperVenue is the only broker")
+        self.ledger, self.venue, self.market, self.clock = ledger, broker, market, clock
+        self.exit_cfg, self.reconcile_cfg, self.paper_cfg = exit_cfg, reconcile_cfg, paper_cfg
 
     @property
     def name(self) -> str:
@@ -42,10 +49,10 @@ class PaperEngine:
         self.ledger.submitted(o["order_id"])
         try:
             fill = self.venue.submit(o, ref_price, liquidity, flags)
-        except VenueReject as e:
+        except BrokerReject as e:
             self.ledger.rejected(o["order_id"], str(e))
             return "REJECTED"
-        except (DeliveryTimeout, Exception) as e:     # any lost answer is UNKNOWN
+        except Exception as e:                        # a timeout, or any lost answer: UNKNOWN
             self.ledger.unknown(o["order_id"], f"{type(e).__name__}: {e}")
             log.error("%s order %s UNKNOWN: %s. No new orders until reconciled.",
                       self.name, o["order_id"], e)
@@ -95,12 +102,17 @@ class PaperEngine:
         t, why = sizing.ticket(self.ledger.free_cash(), size_factor, q.liquidity_usd)
         if not t:
             return {"status": "SKIPPED", "reason": why, "token_key": key}
+        slip = slippage_bps(t, q.liquidity_usd, self.paper_cfg)
+        if slip > self.paper_cfg["max_slippage_bps"]:
+            return {"status": "SKIPPED", "reason": "slippage_over_max", "token_key": key,
+                    "expected_slippage_bps": slip}
         try:
             o = self.ledger.create_order(
                 side="buy", token_key=key, ticker=d["ticker"], notional_usd=t,
                 reserve_usd=t + sizing.entry_fee(t),
                 idem_key=f"{self.name}:buy:{key}:{cycle_id}",
-                meta={**(meta or {}), "size_factor": size_factor, "ref_price": q.price_usd})
+                meta={**(meta or {}), "size_factor": size_factor, "ref_price": q.price_usd,
+                      "ref_liquidity": q.liquidity_usd})
         except DuplicateOrder:
             return {"status": "SKIPPED", "reason": "duplicate", "token_key": key}
         status = self._send(o, q.price_usd, q.liquidity_usd)
@@ -155,9 +167,21 @@ class PaperEngine:
 
 
 def build(db_path: str, market, *, clock=time.time, names=("strategy", "baseline"),
-          faults=None, new_id=None) -> dict[str, PaperEngine]:
-    """One database, one simulated venue, one ledger and engine per name."""
+          faults=None, journal=None, starting_cash=None, replay=False) -> dict[str, PaperEngine]:
+    """One database, one simulated venue, one ledger and engine per name.
+
+    Quotes and broker answers go through the journal. With replay=True there is no
+    venue and no market behind it: every answer comes from the recorded journal."""
     db = connect(db_path)
-    venue = PaperVenue(db, faults=faults, clock=clock)
-    kw = {"clock": clock} | ({"new_id": new_id} if new_id else {})
-    return {n: PaperEngine(Ledger(db, n, **kw), venue, market, clock=clock) for n in names}
+    journal = journal or NullJournal()
+    if replay:
+        inner_broker, inner_market = None, None
+    else:
+        inner_broker = PaperVenue(db, faults=faults, clock=clock)
+        inner_market = market
+    brk = JournaledBroker(inner_broker, journal)
+    mkt = JournaledMarket(inner_market, journal)
+    cash = starting_cash if isinstance(starting_cash, dict) else \
+        {n: starting_cash for n in names}
+    return {n: PaperEngine(Ledger(db, n, clock=clock, starting_cash=cash.get(n)), brk, mkt,
+                           clock=clock) for n in names}

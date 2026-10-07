@@ -1,7 +1,7 @@
 import pytest
 
 from ledger import connect
-from venue import FaultPlan, PaperVenue, VenueReject, simulate_fill
+from venue import FaultPlan, PaperVenue, VenueReject, simulate_fill, slippage_bps
 
 CFG = {"fee_rate": 0.0045, "min_fee_usd": 0.95, "base_slippage_bps": 50,
        "impact_bps_per_pct_of_pool": 200, "max_slippage_bps": 500}
@@ -23,8 +23,13 @@ def test_sell_fill_is_exact_and_fee_floor_applies():
     assert f.fee_usd == 0.95
 
 
-def test_slippage_over_max_completes_and_is_flagged():
-    f = simulate_fill("buy", 1.0, 10_000, notional_usd=1_000, cfg=CFG)   # 10% of pool
+def test_entry_over_max_slippage_is_rejected():
+    with pytest.raises(VenueReject, match="slippage_over_max"):
+        simulate_fill("buy", 1.0, 10_000, notional_usd=1_000, cfg=CFG)   # 2,050 bps
+
+
+def test_exit_over_max_slippage_completes_and_is_flagged():
+    f = simulate_fill("sell", 1.0, 10_000, qty=1_000, cfg=CFG)
     assert f.slippage_bps == 2_050 and f.flags == ("slippage_over_max",)
 
 
@@ -46,3 +51,7 @@ def test_resubmitting_an_order_id_never_fills_twice():
     f2 = v.submit(o, 5.0, 1e3)                   # different market, same id
     assert f1 == f2
     assert v.db.execute("SELECT COUNT(*) FROM venue_orders").fetchone()[0] == 1
+
+
+def test_slippage_formula():
+    assert slippage_bps(2_000, 100_000, CFG) == 50 + 200 * 2

@@ -5,25 +5,17 @@ enforced in Python instead, on paper:
 
 | seat  | now lives in      | notes |
 |-------|-------------------|-------|
-| SIZE  | `sizing.ticket`   | `kelly_fraction` is a 3% placeholder until paper results give an edge |
-| FILLS | `venue.simulate_fill` | fee 0.45% / $0.95 floor per side, slippage model in `thresholds.PAPER` |
+| SIZE  | `sizing.ticket`   | step 1 uses `fixed_ticket_fraction`, a fixed 3% placeholder, not a Kelly allocation |
+| FILLS | `venue.simulate_fill` | fee 0.45% / $0.95 floor per side; entries over max slippage are rejected |
 | RISK  | `exits.decide`    | volume ratio rule, blind close after failed quotes, optional stops |
 
-The original prompt text follows for reference.
+The original prompt text follows for reference. Where it differs from the Python, the
+Python wins: SIZE step 1's `kelly(edge)` is not implemented, because no edge has been
+measured, and an entry whose expected slippage is over the maximum is rejected before it
+is sent rather than completed and flagged. Exits still complete and flag.
 
 Jev picks what to hold. Grok Bot decides how much and how long. The exit rule answers to
 neither of them.
-
-## Fill these in before going live
-
-The original guide leaves these undefined. Each seat needs a number, not a feeling:
-
-| seat  | value                       | used in                     |
-|-------|-----------------------------|-----------------------------|
-| SIZE  | `edge` fed to kelly         | step 1                      |
-| SIZE  | fee floor viable size       | step 4, match FILLS' floor  |
-| FILLS | max effective fee           | step 2                      |
-| FILLS | max slippage bps            | step 4                      |
 
 ## SIZE
 

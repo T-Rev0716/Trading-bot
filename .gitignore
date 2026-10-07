@@ -9,3 +9,4 @@ shadow.jsonl
 paper.db
 paper.db-*
 paper_tape.jsonl
+runs/

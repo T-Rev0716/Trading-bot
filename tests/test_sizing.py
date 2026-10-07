@@ -1,15 +1,15 @@
 from sizing import entry_fee, intended_ticket, ticket
 
-CFG = {"kelly_fraction": 0.03, "max_ticket_fraction": 0.06, "max_pool_share": 0.02,
+CFG = {"fixed_ticket_fraction": 0.03, "max_ticket_fraction": 0.06, "max_pool_share": 0.02,
        "max_fee_rate": 0.01}
 
 
-def test_kelly_times_free_cash():
+def test_fixed_fraction_times_free_cash():
     assert ticket(10_000, 1.0, 1_000_000, cfg=CFG) == (300.0, None)
 
 
-def test_kelly_is_clamped_at_the_max_fraction():
-    assert ticket(10_000, 1.0, 1_000_000, cfg=CFG | {"kelly_fraction": 0.5})[0] == 600.0
+def test_fraction_is_clamped_at_the_max():
+    assert ticket(10_000, 1.0, 1_000_000, cfg=CFG | {"fixed_ticket_fraction": 0.5})[0] == 600.0
 
 
 def test_size_factor_and_pool_cap():
@@ -39,5 +39,5 @@ def test_default_bank_can_clear_the_fee_floor():
     """With the guide's $1,500 bank no ticket could ever clear a 1% fee: 6% of 1,500 is
        $90 and the $0.95 floor needs $95. The paper default must be able to trade."""
     from thresholds import PAPER, SIZING
-    assert ticket(1_500, 1.0, 1e9, cfg=SIZING | {"kelly_fraction": 1.0})[1] == "fee_floor"
+    assert ticket(1_500, 1.0, 1e9, cfg=SIZING | {"fixed_ticket_fraction": 1.0})[1] == "fee_floor"
     assert ticket(PAPER["starting_cash_usd"], 1.0, 1e9)[1] is None

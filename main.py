@@ -1,15 +1,19 @@
 """THE SHIFT, on paper. Live execution is disabled: there is no path to a real venue.
 
-    python main.py            run the paper desk: poll every 5 min, scan every 15
-    python main.py --once     one poll and one scan, then exit
+    python main.py                           a new run in runs/<run_id>/
+    python main.py --starting-cash 1500      the paper bank for a new run
+    python main.py --resume runs/<run_id>    continue a run, e.g. after a crash
+    python main.py --once                    one poll and one scan, then exit
+
+Each run is a directory: paper.db (ledgers) and journal.jsonl (every event in order).
+`python report.py runs/<run_id>` compares the ledgers; `python replay.py
+runs/<run_id>/journal.jsonl` replays the journal and checks it reproduces the run.
 
 Two ledgers trade side by side on the same candidates and the same simulated venue:
   strategy   Jev's answers, SOFT gates, the pick
   baseline   the same checks and rules only, no judge
-`python report.py` compares them. `python replay.py paper_tape.jsonl` replays the tape.
 """
 import argparse
-import json
 import logging
 import os
 import sys
@@ -17,8 +21,8 @@ import time
 
 import book
 import eligibility
+import session
 from collect import universe, shortlist, trade_counts, dossier, social_state, GT_PER_MINUTE
-from cycle import enter
 from filter import free_kill, trade_kill
 from questions import STATE_FIELDS
 from sizing import intended_ticket
@@ -29,7 +33,6 @@ NETS          = ("solana", "bsc", "robinhood")
 PAGES         = 2           # 3 chains x 2 pages = 6 GT slots before the funnel starts
 GT_DOSSIER    = GT_PER_MINUTE - len(NETS) * PAGES     # what is left for dossiers: 4 at 10/min
 DEX_BUDGET    = 25          # DexScreener calls per cycle, pass two only
-TAPE_FIELDS   = ("x_account", "description", "gt_score_details")   # big; kept as presence
 log = logging.getLogger("desk")
 
 
@@ -106,53 +109,24 @@ def scan(fomo, judge, desk, free_cash: float, ask_judge: bool):
     return cands, stats
 
 
-def _tape_row(d: dict) -> dict:
-    row = {k: v for k, v in d.items() if k not in TAPE_FIELDS}
-    row["x_account"] = {"present": True} if d.get("x_account") else None
-    return row
-
-
-def run_cycle(fomo, judge, desk, engines, tape_path=None, now=None):
-    """One scan and its entries. Skipped entirely when neither ledger can enter."""
-    blocked = {n: e.can_enter() for n, e in engines.items()}
-    if all(blocked.values()):
-        return {"skipped": blocked}
-    now = now if now is not None else time.time()
-    cycle_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
-    fomo.token()                                 # Privy bearer lives ~60 min, refresh it
-    strat = engines["strategy"]
-    cands, stats = scan(fomo, judge, desk, strat.ledger.free_cash(),
-                        ask_judge=blocked["strategy"] is None)
-    res = enter(cands, judge, engines, cycle_id)
-    if tape_path:
-        with open(tape_path, "a") as f:
-            f.write(json.dumps({"type": "cycle", "ts": now, "cycle_id": cycle_id,
-                                "candidates": [{"d": _tape_row(d), "answers": a}
-                                               for d, a in cands],
-                                "pick": res.get("strategy_pick")}, default=str) + "\n")
-    res.pop("strategy_pick", None)
-    return {"cycle_id": cycle_id, "blocked": blocked, "stats": stats, **res}
-
-
-def main(fomo, judge, desk, engines, tape_path=None, once=False):
+def main(fomo, judge, desk, engines, journal, clock, once=False):
     from judge_client import JudgeMalformed
     tick = 0
     while True:
         started = time.monotonic()
-        polls = {n: e.tick() for n, e in engines.items()}
+        polls = session.poll(engines, journal, clock, time.time())
         for n, p in polls.items():
             if p["reconciled"] or p["exits"]:
                 desk.report(f"{n}: {p}")
         if tick % SCAN_EVERY == 0:
+            scan_fn = lambda ask, free: (fomo.token(), scan(fomo, judge, desk, free, ask))[1]
             try:
-                desk.report(run_cycle(fomo, judge, desk, engines, tape_path))
+                desk.report(session.cycle(engines, journal, clock, time.time(), scan_fn,
+                                          judge))
             except JudgeMalformed as e:
                 log.error("422 from the judge, fix questions.py before the next run: %s", e)
                 desk.report(f"stood down, malformed question: {e}")
                 raise                            # every token would hit the same wall
-            except Exception as e:
-                log.exception("cycle blew up: %s", e)
-                desk.report(f"stood down: {type(e).__name__}: {e}")
         if once:
             return
         tick += 1
@@ -163,6 +137,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--once", action="store_true", help="one poll and one scan, then exit")
+    ap.add_argument("--starting-cash", type=float,
+                    default=os.environ.get("PAPER_STARTING_CASH"),
+                    help="paper bank for a new run (default thresholds.PAPER)")
+    ap.add_argument("--resume", metavar="RUN_DIR", help="continue an existing run")
     ap.add_argument("--live", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args.live:
@@ -170,13 +148,22 @@ if __name__ == "__main__":
 
     from desk import Desk
     from fomo_api import Fomo
+    from journal import RecordJournal
     from judge_client import judge
-    from market import DexScreenerMarket, RecordingMarket
+    from market import DexScreenerMarket
     from paper import build
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    tape = os.environ.get("PAPER_TAPE", "paper_tape.jsonl")
-    market = RecordingMarket(DexScreenerMarket(time.time), tape)
-    engines = build(os.environ.get("PAPER_DB", "paper.db"), market)
-    main(Fomo(), judge, Desk(), engines, tape_path=tape, once=args.once)
+    clock = session.SessionClock()
+    run_dir = args.resume or os.path.join(
+        "runs", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(clock())))
+    if not args.resume and os.path.exists(run_dir):
+        sys.exit(f"{run_dir} already exists")
+    os.makedirs(run_dir, exist_ok=True)
+    journal = RecordJournal(os.path.join(run_dir, "journal.jsonl"))
+    engines = build(os.path.join(run_dir, "paper.db"), DexScreenerMarket(clock), clock=clock,
+                    journal=journal, starting_cash=args.starting_cash)
+    session.start(engines, journal, clock, resumed=bool(args.resume))
+    log.info("paper run %s, live execution disabled", run_dir)
+    main(Fomo(), judge, Desk(), engines, journal, clock, once=args.once)
