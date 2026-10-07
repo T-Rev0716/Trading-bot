@@ -1,0 +1,264 @@
+"""SCAN and VET. Jev fetches nothing, so this is the code that goes and gets everything.
+
+SCAN runs universe and shortlist, VET runs trade_counts and dossier.
+Every field name the rest of the desk reads is set here, once.
+"""
+import collections
+import logging
+import time
+
+import requests
+
+from fomo_api import Fomo
+
+GT  = "https://api.geckoterminal.com/api/v2"
+DEX = "https://api.dexscreener.com/latest/dex/tokens"
+SOL_RPC = "https://api.mainnet-beta.solana.com"
+log = logging.getLogger("desk.collect")
+
+# the three chains the desk trades, plus Base which shares the BSC question set
+GT_NET   = {1399811149: "solana", 4663: "robinhood", 56: "bsc", 8453: "base"}
+FOMO_NET = {v: k for k, v in GT_NET.items()}
+# DexScreener chainId per FOMO netId. An EVM address can exist on several chains, so
+# pairs are filtered to the token's own chain. If Robinhood pairs never match, check
+# the chainId DexScreener uses for it and fix it here.
+DEX_CHAIN = {1399811149: "solana", 4663: "robinhood", 56: "bsc", 8453: "base"}
+
+GT_PER_MINUTE = 10                  # free tier
+_gt_calls = collections.deque()
+
+
+def gt_get(path: str, **params) -> dict:
+    """Every GeckoTerminal call goes through here, so the desk can never pass 10/min.
+       It waits for a slot rather than earning a 429."""
+    while len(_gt_calls) >= GT_PER_MINUTE:
+        wait = 60.5 - (time.monotonic() - _gt_calls[0])
+        if wait > 0:
+            time.sleep(wait)
+        _gt_calls.popleft()
+    _gt_calls.append(time.monotonic())
+    r = requests.get(f"{GT}{path}", params=params, timeout=20,
+                     headers={"Accept": "application/json"})
+    r.raise_for_status()                    # a 429 here means another process shares the IP
+    return r.json()
+
+
+def age_minutes(created) -> float | None:
+    """createdAt comes back as epoch seconds or milliseconds depending on the row.
+       Unknown stays unknown: a missing launch time is not a fresh launch."""
+    if not created:
+        return None
+    try:
+        c = float(created)
+    except (TypeError, ValueError):
+        return None
+    if c > 1e11:                                # milliseconds
+        c /= 1000
+    return max(0.0, (time.time() - c) / 60)
+
+
+def universe(nets=("solana", "bsc", "robinhood"), pages=2) -> list[str]:
+    """Where the whole thing starts. Fresh pools per chain -> ['<addr>:<netId>', ...].
+       Costs one GeckoTerminal slot per chain per page, so keep pages small."""
+    ids, seen = [], set()
+    for net in nets:
+        for page in range(1, pages + 1):
+            try:
+                r = gt_get(f"/networks/{net}/new_pools", page=page)
+            except Exception as e:
+                log.warning("new_pools %s p%d failed: %s", net, page, e)
+                break
+            for pool in r.get("data", []):
+                base = ((pool.get("relationships") or {}).get("base_token") or {})
+                gid  = (base.get("data") or {}).get("id")      # 'solana_<addr>'
+                if not gid or "_" not in gid:
+                    continue
+                addr = gid.split("_", 1)[1]
+                tid  = f"{addr}:{FOMO_NET[net]}"
+                if tid not in seen:
+                    seen.add(tid)
+                    ids.append(tid)
+    return ids
+
+
+def normalise(tid: str, m: dict) -> dict:
+    """FOMO's field names become the desk's field names, once, here.
+       Every file downstream reads these names and only these."""
+    addr, net = tid.split(":")
+    return {"addr": addr, "net": int(net), "tid": tid, "ticker": m["symbol"],
+            "mcap_usd": m["mcap"], "liquidity_usd": m["liq"],
+            "volume_h24": m["vol24"], "price_usd": m["price"],
+            "holder_count": m["holders"] or None,
+            "change": {"5m": m["change"].get(300), "1h": m["change"].get(3600),
+                       "4h": m["change"].get(14400), "12h": m["change"].get(43200),
+                       "24h": m["change"].get(86400)},
+            "age_minutes": age_minutes(m["created"])}
+
+
+def shortlist(fomo: Fomo, ids: list[str]) -> list[dict]:
+    """Pass one over everything FOMO knows. No network beyond FOMO itself:
+       one call per twenty tokens, and not a single request per token."""
+    out = []
+    for tid, m in fomo.tokens(ids).items():             # 20 per call
+        t = normalise(tid, m)
+        if t["net"] in GT_NET:
+            out.append(t)
+    # turnover ranks the queue. It orders work, it does not decide anything
+    out.sort(key=lambda t: (t["volume_h24"] or 0) / max(t["mcap_usd"] or 0, 1),
+             reverse=True)
+    return out
+
+
+_NO_TRADES = {"buys_h1": None, "sells_h1": None, "buys_h6": None, "sells_h6": None,
+              "trades_h24": None, "volume_h1": None, "volume_h6": None}
+
+
+def trade_counts(t: dict) -> dict:
+    """buys and sells per window. FOMO does not return them, DexScreener does.
+       Called ONLY for tokens that already cleared the free checks. One per token,
+       so this runs on tens, never on the whole universe."""
+    try:
+        r = requests.get(f"{DEX}/{t['addr']}", timeout=20)
+        r.raise_for_status()
+        pairs = r.json().get("pairs") or []
+    except Exception as e:
+        log.warning("dexscreener %s failed: %s", t["ticker"], e)
+        return dict(_NO_TRADES)
+    chain = DEX_CHAIN.get(t["net"])
+    mine = [p for p in pairs if p.get("chainId") == chain]
+    if pairs and not mine:
+        log.warning("dexscreener has %s only on %s, not %s", t["ticker"],
+                    sorted({p.get("chainId") for p in pairs}), chain)
+    if not mine:
+        return dict(_NO_TRADES)
+    p = max(mine, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+    x, v = p.get("txns") or {}, p.get("volume") or {}
+    win = lambda w, side: (x.get(w) or {}).get(side)
+    b24, s24 = win("h24", "buys"), win("h24", "sells")
+    return {"buys_h1": win("h1", "buys"), "sells_h1": win("h1", "sells"),
+            "buys_h6": win("h6", "buys"), "sells_h6": win("h6", "sells"),
+            "trades_h24": b24 + s24 if b24 is not None and s24 is not None else None,
+            "volume_h1": v.get("h1"), "volume_h6": v.get("h6")}
+
+
+def flag(v) -> bool | None:
+    """GeckoTerminal answers flags as true/false, 'yes'/'no', an address, or 'unknown'.
+       One meaning out: True, False, or None for not known."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("yes", "true", "1"):
+            return True
+        if s in ("no", "false", "0"):
+            return False
+        if len(s) >= 32 and s.isalnum():           # an authority address is set
+            return True
+    return None
+
+
+def share(pct) -> float | None:
+    """GeckoTerminal distribution is a percent string. The desk uses fractions."""
+    try:
+        return float(pct) / 100 if pct is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def dossier(t: dict) -> dict:
+    """One GT call per token. Fills what the chain actually has, null where it does not."""
+    net = GT_NET[t["net"]]
+    a = gt_get(f"/networks/{net}/tokens/{t['addr']}/info")["data"]["attributes"]
+    holders = a.get("holders") or {}
+
+    d = {**t, "chain": net,
+         # GT first, FOMO as the fallback. On Robinhood GT is null and FOMO is all you get.
+         "holder_count": holders.get("count") or t["holder_count"],
+         "top_10_share": share((holders.get("distribution_percentage") or {})
+                               .get("top_10")),
+         "top_wallet_share": None,
+         "developer_holding_percentage": a.get("developer_holding_percentage"),
+         "gt_score_details": a.get("gt_score_details"),
+         "is_honeypot": flag(a.get("is_honeypot")),
+         "mint_authority_open": flag(a.get("mint_authority")),
+         "freeze_authority_open": flag(a.get("freeze_authority")),
+         "description": a.get("description"),
+         "x_handle": clean_handle(a.get("twitter_handle"))}
+
+    # Solana only: exact top wallet share, free, off the public RPC
+    if t["net"] == 1399811149:
+        try:
+            d["top_wallet_share"] = sol_top_wallet(t["addr"])
+        except Exception as e:
+            log.warning("solana rpc %s failed: %s", t["ticker"], e)   # stays null
+    return d
+
+
+def clean_handle(h):
+    """GT returned 'LuffyX100X/status/2102659581109272876' on a Robinhood token.
+       Take the handle segment, or treat the account as missing."""
+    if not h:
+        return None
+    h = h.strip()
+    for host in ("x.com/", "twitter.com/"):
+        if host in h:
+            h = h.split(host, 1)[1]
+    h = h.lstrip("@").split("?")[0].split("/")[0]
+    return h if h and h.replace("_", "").isalnum() and len(h) <= 15 else None
+
+
+# token accounts owned by these are pools or burns, not holders
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
+NOT_A_HOLDER = {
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",   # Raydium AMM v4 authority
+    "GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL",   # Raydium CPMM authority
+    "1nc1nerator11111111111111111111111111111111",    # incinerator
+}
+
+
+def _rpc(method: str, params: list):
+    r = requests.post(SOL_RPC, timeout=20, json={"jsonrpc": "2.0", "id": 1,
+                                                 "method": method, "params": params})
+    r.raise_for_status()
+    body = r.json()
+    if "error" in body:
+        raise RuntimeError(body["error"])
+    return body["result"]
+
+
+def sol_top_wallet(mint: str) -> float | None:
+    """Share of supply in the largest account that is a wallet.
+
+       The largest token account on a fresh launch is almost always the pool or the
+       bonding curve. Counting it would fail every token, so accounts whose owner is a
+       program account (pool state, bonding curve) or a known AMM authority are skipped."""
+    supply = float(_rpc("getTokenSupply", [mint])["value"]["amount"])
+    top = _rpc("getTokenLargestAccounts", [mint])["value"]
+    if not supply or not top:
+        return None
+    accts = _rpc("getMultipleAccounts", [[x["address"] for x in top],
+                                         {"encoding": "jsonParsed"}])["value"]
+    owners = [((((a or {}).get("data") or {}).get("parsed") or {}).get("info") or {})
+              .get("owner") for a in accts]
+    known = sorted({o for o in owners if o})
+    kinds = _rpc("getMultipleAccounts", [known, {"encoding": "base64",
+                                                 "dataSlice": {"offset": 0, "length": 0}}]
+                 )["value"] if known else []
+    program_of = {o: (k or {}).get("owner") for o, k in zip(known, kinds)}
+
+    for x, owner in zip(top, owners):
+        if not owner or owner in NOT_A_HOLDER:
+            continue
+        prog = program_of.get(owner)
+        if prog is not None and prog != SYSTEM_PROGRAM:
+            continue                                # owned by a program: pool or curve
+        return float(x["amount"]) / supply
+    return None
+
+
+def social_state(d: dict) -> dict:
+    """What SOCIAL hands the judge. The X block is filled by the bot's X plugin."""
+    return {"x_account": d["x_account"],                 # collected by SOCIAL, not here
+            "published_handle": d["x_handle"],
+            "token": {"ticker": d["ticker"], "narrative": d.get("description"),
+                      "age_minutes": d.get("age_minutes")}}

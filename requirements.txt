@@ -1,0 +1,5 @@
+typesafe-sdk>=0.7.2,<0.8
+fastapi>=0.110
+uvicorn>=0.29
+requests>=2.31
+websocket-client>=1.7

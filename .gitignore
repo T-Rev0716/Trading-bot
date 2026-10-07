@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+desk.db
+desk.db-*
+shadow.jsonl
+.pytest_cache/
+.venv/
