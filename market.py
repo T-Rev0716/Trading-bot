@@ -26,6 +26,14 @@ def _f(v):
         return None
 
 
+def quote_from_pair(p: dict, ts: float) -> Quote:
+    """One DexScreener pair -> a Quote. priceUsd arrives as a decimal string."""
+    v = p.get("volume") or {}
+    return Quote(price_usd=_f(p.get("priceUsd")),
+                 liquidity_usd=_f((p.get("liquidity") or {}).get("usd")),
+                 volume_h6=_f(v.get("h6")), volume_h24=_f(v.get("h24")), ts=ts)
+
+
 class DexScreenerMarket:
     """Live quotes off DexScreener's public API, filtered to the token's own chain."""
 
@@ -41,11 +49,7 @@ class DexScreenerMarket:
             raise QuoteUnavailable(f"{key}: {e}") from e
         if p is None:
             raise QuoteUnavailable(f"{key}: no pair on {chain}")
-        v = p.get("volume") or {}
-        return Quote(price_usd=_f(p.get("priceUsd")),
-                     liquidity_usd=_f((p.get("liquidity") or {}).get("usd")),
-                     volume_h6=_f(v.get("h6")), volume_h24=_f(v.get("h24")),
-                     ts=self.clock())
+        return quote_from_pair(p, self.clock())
 
 
 class StaticMarket:

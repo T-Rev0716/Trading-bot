@@ -49,6 +49,8 @@ same sizing and the same exits:
 | `report.py`       | performance per ledger: observed, assumed and stress, side by side |
 | `replay.py`       | exact replay of a run's journal, failing on the first divergence  |
 | `scenarios.py`    | SYNTHETIC scenarios, kept apart from any market evidence          |
+| `diagnose.py`     | read-only integration diagnostic; saves sanitized fixtures        |
+| `sanitize.py`     | strips keys, auth headers, cookies and login tokens from output   |
 | `book.py`         | the bench, scoped shared or strategy-only                         |
 | `desk.py`         | X reads and Telegram reports. No order delivery                   |
 | `main.py`         | the paper shift                                                   |
@@ -63,6 +65,8 @@ pip install -r requirements.txt
 cp .env.example .env        # fill it in, then: set -a; . ./.env; set +a
 ```
 
+0. **Check the integrations first:** `python diagnose.py` (see
+   `docs/INTEGRATION_STATUS.md`). Do not run the desk until every service is OK.
 1. **Jev key** in `TYPESAFE_API_KEY` on the judge machine. Prove it with the curl in
    `prompts/HANDOFF.md`.
 2. **Desk secret:** `export DESK_SECRET="$(openssl rand -hex 24)"`.
@@ -196,16 +200,26 @@ quote, a reordered event, a missing event or a changed threshold stops the repla
 
 The regression tests record runs with quote outages, a lost-before-receipt entry,
 executed-but-unacknowledged entries and exits, venue lookups that fail, a blind close and
-a crash-resume. Each replay must reproduce the orders, order history, positions,
-balances and equity marks exactly.
+a restart. Each replay must reproduce the orders, order history, positions, balances and
+equity marks exactly. `python replay.py --compare runs/<run_id>` does the same for a real
+run: it replays the journal and compares every ledger row with the run's `paper.db`.
+
+Two limits:
+- **Replay starts from the recorded scanner output.** The scan (FOMO, GeckoTerminal,
+  DexScreener, Solana RPC, the per-token judge calls, the bench) is one journaled
+  `candidates` answer per cycle and is not re-run, so replay cannot catch a scanner or
+  per-token judging difference.
+- **The resume test covers a restart after a completed cycle.** A crash mid-send (an
+  order left `SUBMITTED`) is covered by a ledger unit test, not by a journal replay.
 
 ## Results
 
 ### Market evidence
 
-**None yet.** Nothing here has run against live data. Evidence can only come from paper
-runs on live data: `python main.py`, then `python report.py` and `python replay.py`.
-Even then it is simulated fills, not trading results.
+**None.** No integration has been reached from the build environment (see
+`docs/INTEGRATION_STATUS.md`), so nothing here has run on live data, and this repository
+makes no profitability claims. A paper run on live data would still be simulated fills,
+not trading results.
 
 ### Synthetic demonstrations (not evidence)
 
@@ -217,20 +231,24 @@ zero-recovery stress, and a lost acknowledgement. They say nothing about edge.
 
 ## Integration status
 
-| integration | status | what that means |
+**Feature development is frozen until the integrations are checked against real
+responses.** `python diagnose.py` checks each service on its own (read-only, Solana
+only), reports connectivity, schema, missing fields and parse errors, and verifies the
+field meanings the parsers rely on. It never prints, logs or saves keys, authorization
+headers, cookies or login tokens. Details, the last run's output and exact local setup
+steps: **`docs/INTEGRATION_STATUS.md`**.
+
+| integration | status | evidence |
 |---|---|---|
-| `typesafe-sdk` 0.7.2 | **verified (offline)** | Package inspected and installed. Every question set goes through the real SDK client against a mocked HTTP endpoint in the tests. |
-| TypeSafe / Jev API | **mocked** | No key here. Never called. Answers in all tests are fabricated. |
-| Paper venue, ledger, sizing, exits, report | **verified** | Built here, deterministic, covered by tests including fault injection. |
-| Journal and exact replay | **verified** | Record-then-replay tests match every table row for row, through outages and lost acknowledgements. Not yet run on a live-data journal. |
-| GeckoTerminal | **mocked** | Blocked from this sandbox. Parsing matches the guide's field names; whether flags come back as booleans or `"yes"`/`"no"` is handled both ways but not observed. |
-| DexScreener | **mocked** | Not reachable here. Used for trade counts and for every paper quote. Robinhood's chainId (`robinhood`) is a guess. In live runs every quote it gives is journaled. |
-| Solana public RPC | **mocked** | Standard JSON-RPC methods; the pool-exclusion logic is tested on fabricated accounts only. |
-| FOMO `/proxy/filterTokens` | **unfinished** | No public docs. The response parser is an assumption (Codex-style rows). Run the probe first. |
-| Privy bearer over Chrome CDP | **unfinished** | Assumes `localStorage['privy:token']`. Untested against a real browser. |
-| X reads (SOCIAL) | **unfinished** | `X_READER_URL` is an interface with nothing behind it. Without it every token takes the 0.6 cut. |
-| Telegram reports | **mocked** | Standard Bot API call, never exercised. |
-| Live order execution | **disabled** | Removed on purpose. No webhook, no seat delivery, no `/book/release` route. |
+| GeckoTerminal | **BLOCKED** here | proxy refused; no real response seen. Parsers unverified |
+| DexScreener | **BLOCKED** here | proxy refused; no real response seen. Robinhood chainId still a guess |
+| Solana RPC | **BLOCKED** here | proxy refused; holder math tested on fabricated accounts only |
+| Jev (TypeSafe) API | **NOT CONFIGURED** here | no key; the SDK is exercised against a mocked endpoint only |
+| FOMO + Privy bearer | **NOT CONFIGURED** here | no logged-in Chrome; response shape is an assumption |
+| X reads (SOCIAL) | **unfinished** | `X_READER_URL` has nothing behind it |
+| Telegram reports | **unexercised** | standard Bot API call, never run |
+| Paper engine, ledger, journal, replay | **tested** | deterministic; record-then-replay matches every ledger row. Not yet run on a live-data journal |
+| Live order execution | **disabled** | no live path exists |
 
 ## What changed from the guide, and why
 

@@ -4,6 +4,8 @@
     python main.py --starting-cash 1500      the paper bank for a new run
     python main.py --resume runs/<run_id>    continue a run, e.g. after a crash
     python main.py --once                    one poll and one scan, then exit
+    python main.py --nets solana --max-polls 12
+                                             a bounded run on Solana only (an hour)
 
 Each run is a directory: paper.db (ledgers) and journal.jsonl (every event in order).
 `python report.py runs/<run_id>` compares the ledgers; `python replay.py
@@ -109,7 +111,7 @@ def scan(fomo, judge, desk, free_cash: float, ask_judge: bool):
     return cands, stats
 
 
-def main(fomo, judge, desk, engines, journal, clock, once=False):
+def main(fomo, judge, desk, engines, journal, clock, once=False, max_polls=None):
     from judge_client import JudgeMalformed
     tick = 0
     while True:
@@ -127,9 +129,9 @@ def main(fomo, judge, desk, engines, journal, clock, once=False):
                 log.error("422 from the judge, fix questions.py before the next run: %s", e)
                 desk.report(f"stood down, malformed question: {e}")
                 raise                            # every token would hit the same wall
-        if once:
-            return
         tick += 1
+        if once or (max_polls is not None and tick >= max_polls):
+            return
         time.sleep(max(0, TICK_SECONDS - (time.monotonic() - started)))
 
 
@@ -141,10 +143,15 @@ if __name__ == "__main__":
                     default=os.environ.get("PAPER_STARTING_CASH"),
                     help="paper bank for a new run (default thresholds.PAPER)")
     ap.add_argument("--resume", metavar="RUN_DIR", help="continue an existing run")
+    ap.add_argument("--nets", default=",".join(NETS),
+                    help="chains to scan, comma separated (default: %(default)s)")
+    ap.add_argument("--max-polls", type=int, help="stop after this many polls")
     ap.add_argument("--live", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args.live:
         sys.exit("Live execution is disabled. This build trades on paper only.")
+    NETS = tuple(n for n in args.nets.split(",") if n)
+    GT_DOSSIER = GT_PER_MINUTE - len(NETS) * PAGES
 
     from desk import Desk
     from fomo_api import Fomo
@@ -166,4 +173,5 @@ if __name__ == "__main__":
                     journal=journal, starting_cash=args.starting_cash)
     session.start(engines, journal, clock, resumed=bool(args.resume))
     log.info("paper run %s, live execution disabled", run_dir)
-    main(Fomo(), judge, Desk(), engines, journal, clock, once=args.once)
+    main(Fomo(), judge, Desk(), engines, journal, clock, once=args.once,
+         max_polls=args.max_polls)

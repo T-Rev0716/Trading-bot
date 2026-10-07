@@ -160,6 +160,12 @@ def test_changed_thresholds_are_refused(monkeypatch):
 
 
 def test_resume_continues_the_same_journal(tmp_path):
+    """Covers a restart AFTER A COMPLETED CYCLE: the first process finishes a poll and a
+       cycle (its entry filled), the second reopens the same paper.db and journal and
+       polls. It does not cover a crash in the middle of a send. That path (an order
+       found SUBMITTED at restart becomes UNKNOWN and is reconciled) is tested in
+       test_lifecycle.py::test_order_left_submitted_by_a_crash_becomes_unknown, without
+       a journal replay."""
     path, db = str(tmp_path / "j.jsonl"), str(tmp_path / "p.db")
     market = StaticMarket()
     market.update(A["token_key"], Quote(1.0, 1e5, 8e4, 3e5, T0))
@@ -179,3 +185,42 @@ def test_resume_continues_the_same_journal(tmp_path):
     session.poll(eng2, j2, clock2, T0 + 600)
     rep = replay.run(replay.load(path))
     assert_same(eng2, rep["engines"])
+
+
+def _recorded_run_dir(tmp_path):
+    """A run written to disk the way main.py writes one: paper.db + journal.jsonl."""
+    run = tmp_path / "run"
+    run.mkdir()
+    market = StaticMarket()
+    clock = session.SessionClock(T0)
+    j = RecordJournal(str(run / "journal.jsonl"))
+    eng = build(str(run / "paper.db"), market, clock=clock, journal=j,
+                faults=FaultPlan(timeout_after_fill={1}))
+    session.start(eng, j, clock)
+    for i, p in enumerate([1.0, 1.1, 1.2, 1.15]):
+        ts = T0 + 300 * i
+        market.update(A["token_key"], Quote(p, 1e5, 1e4 if i == 3 else 8e4, 3e5, ts))
+        session.poll(eng, j, clock, ts)
+        if i == 0:
+            session.cycle(eng, j, clock, ts + 1, lambda a, f: ([(A, answers(A))], {}),
+                          lambda qs, st: {"model": "m", "answers": {
+                              "worth_trading_at_all": {"type": "noul", "noul": 0.9}}})
+    return run
+
+
+def test_compare_run_matches_every_ledger_row_on_disk(tmp_path):
+    run = _recorded_run_dir(tmp_path)
+    result, diffs = replay.compare_run(str(run))
+    assert diffs == []
+    rows = replay.ledger_rows(next(iter(result["engines"].values())).ledger.db)
+    assert len(rows["orders"]) == 4 and len(rows["marks"]) == 8
+
+
+def test_compare_run_reports_a_ledger_row_that_differs(tmp_path):
+    import sqlite3
+    run = _recorded_run_dir(tmp_path)
+    db = sqlite3.connect(str(run / "paper.db"))
+    db.execute("UPDATE accounts SET cash = cash + 0.01 WHERE ledger='strategy'")
+    db.commit()
+    _, diffs = replay.compare_run(str(run))
+    assert diffs and diffs[0].startswith("accounts row")

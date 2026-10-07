@@ -1,6 +1,15 @@
 """Exact replay of a recorded paper run.
 
     python replay.py runs/<run_id>/journal.jsonl
+    python replay.py --compare runs/<run_id>     also compare every ledger row with the
+                                                 run's own paper.db
+
+Replay starts from the RECORDED SCANNER OUTPUT. The scan (FOMO, GeckoTerminal,
+DexScreener trade counts, Solana RPC, the per-token judge calls and the bench) is not
+re-executed: its result is one journaled `candidates` answer per cycle. Replay checks
+everything from there on: eligibility, the pick, sizing, every quote attempt, broker
+submit and lookup, reconciliation, exits and equity. It cannot detect a scanner or
+per-token judging difference.
 
 Rebuilds empty ledgers, then walks the journal in sequence order. Polls and cycles run
 the same code as the live run (session.py); every quote attempt, broker submit and
@@ -12,6 +21,8 @@ ReplayDivergence with the sequence number where it happened.
 This is a fidelity check, not a what-if tool: a changed threshold is refused up front.
 """
 import json
+import os
+import sqlite3
 import sys
 
 import session
@@ -70,10 +81,52 @@ def run(events: list[dict], db_path: str = ":memory:") -> dict:
     return {"engines": engines, "metrics": [metrics(e.ledger) for e in engines.values()]}
 
 
+LEDGER_TABLES = {"accounts": "ledger", "orders": "ledger, created_at, order_id",
+                 "order_events": "rowid", "positions": "ledger, position_id",
+                 "marks": "rowid"}
+
+
+def ledger_rows(db: sqlite3.Connection) -> dict:
+    return {t: [tuple(r) for r in db.execute(f"SELECT * FROM {t} ORDER BY {o}")]
+            for t, o in LEDGER_TABLES.items()}
+
+
+def compare_rows(recorded: dict, replayed: dict) -> list[str]:
+    """Differences, table by table. Empty means every ledger row matches."""
+    diffs = []
+    for t in LEDGER_TABLES:
+        a, b = recorded[t], replayed[t]
+        if len(a) != len(b):
+            diffs.append(f"{t}: {len(a)} recorded rows, {len(b)} replayed")
+        for i, (x, y) in enumerate(zip(a, b)):
+            if x != y:
+                diffs.append(f"{t} row {i}: recorded {x} != replayed {y}")
+    return diffs
+
+
+def compare_run(run_dir: str) -> tuple[dict, list[str]]:
+    result = run(load(os.path.join(run_dir, "journal.jsonl")))
+    db = next(iter(result["engines"].values())).ledger.db
+    rec = sqlite3.connect(f"file:{os.path.join(run_dir, 'paper.db')}?mode=ro", uri=True)
+    return result, compare_rows(ledger_rows(rec), ledger_rows(db))
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    if args[:1] == ["--compare"] and len(args) == 2:
+        result, diffs = compare_run(args[1])
+        rows = ledger_rows(next(iter(result["engines"].values())).ledger.db)
+        print("journal replayed with no divergence")
+        print("ledger rows: " + ", ".join(f"{t} {len(r)}" for t, r in rows.items()))
+        if diffs:
+            print("LEDGER ROWS DIFFER:\n" + "\n".join(diffs[:50]))
+            sys.exit(1)
+        print("every ledger row matches the recorded paper.db\n")
+    elif len(args) == 1:
+        result = run(load(args[0]))
+        print(f"replayed {len(load(args[0]))} events with no divergence\n")
+    else:
         print(__doc__)
         sys.exit(2)
-    result = run(load(sys.argv[1]))
-    print(f"replayed {len(load(sys.argv[1]))} events with no divergence\n")
+    print("SIMULATED PAPER RESULTS. Not market evidence.\n")
     print(compare(result["metrics"]))
