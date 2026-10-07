@@ -154,7 +154,8 @@ def _results(payload) -> list[dict]:
             return payload
         return []
     if isinstance(payload, dict):
-        for k in ("results", "data", "filterTokens", "tokens", "items"):
+        # responseObject: the wrapper observed from the live proxy
+        for k in ("responseObject", "results", "data", "filterTokens", "tokens", "items"):
             if k in payload:
                 found = _results(payload[k])
                 if found:

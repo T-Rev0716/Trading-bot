@@ -52,6 +52,7 @@ same sizing and the same exits:
 | `diagnose.py`     | read-only integration diagnostic; saves sanitized fixtures        |
 | `sanitize.py`     | strips keys, auth headers, cookies and login tokens from output   |
 | `book.py`         | the bench, scoped shared or strategy-only                         |
+| `watchlist.py`    | discovered tokens watched until they mature or expire (persistent) |
 | `desk.py`         | X reads and Telegram reports. No order delivery                   |
 | `main.py`         | the paper shift                                                   |
 | `prompts/`        | the bot prompts, kept for reference. Not wired to anything        |
@@ -83,6 +84,31 @@ cp .env.example .env        # fill it in, then: set -a; . ./.env; set +a
    `python replay.py runs/<run_id>/journal.jsonl` replays the run and confirms it
    reproduces exactly.
 7. **Tests:** `pip install -r requirements-dev.txt && pytest -q`.
+
+## Discovery and the watchlist
+
+GeckoTerminal's newest pools on Solana are minutes old, and the desk's floor is 15
+minutes. The first real paper cycle saw 40 tokens and rejected all 40 on age. Two things
+starved it: discovery only reads the two newest pages, and a too-young token was benched
+for 20 minutes, by which time it had left those pages for good.
+
+Now:
+- Age rejections are split: `age_too_young`, `age_too_old`, `age_missing`. Each scan logs
+  how many fell in each band, with the observed age range in minutes (`stats["age"]`).
+- **Too young is never benched.** Too old is benched for good (a token only gets older).
+  Missing is benched for 20 minutes and then looked at again.
+- Every token FOMO returns that is not too old goes on a **watchlist** (`watchlist.py`, in
+  `desk.db`, so it survives restarts). Each cycle re-fetches the watched tokens from FOMO
+  together with the newest pages, so a token is judged on current data once it matures,
+  even after it has left discovery.
+- An entry expires at launch time + 72 h (the max age); one observed too old, or rejected
+  for a permanent fact, is dropped. At most 200 entries; the earliest discovered is
+  evicted first. Re-fetching costs one FOMO call per 20 tokens.
+- A token skipped because the cycle's DexScreener / GeckoTerminal budget ran out stays
+  watched and is tried next cycle (`deferred_budget`), instead of being lost.
+
+The thresholds are unchanged. The scan's output, including the watchlist and age stats,
+is journaled per cycle, so replay and resume stay exact.
 
 ## The paper engine
 

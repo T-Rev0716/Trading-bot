@@ -35,26 +35,34 @@ BENCH_MINUTES = {
     # can change inside the hour, keep it short or you miss the token maturing
     "shape": 25, "shape_weak": 25, "momentum_already_spent": 25,
     "liquidity_fits_ticket": 25, "liquidity": 25, "volume": 25,
-    "trades": 25, "mcap": 25, "age": 20, "dossier_failed": 30,
+    "trades": 25, "mcap": 25, "dossier_failed": 30,
+    # age: a token only gets older. Too old is final; too young is never benched (it is
+    # watched until it matures, see watchlist.py); missing may be filled in later.
+    "age_too_old": 100_000, "age_missing": 20, "age_too_young": 0,
 }
 DEFAULT_BENCH = 45
 
 
-def benched(tid: str) -> str | None:
+def benched(tid: str, now: float | None = None) -> str | None:
     """'shared', 'strategy', or None when the token is free to look at."""
+    now = time.time() if now is None else now
     with _lock:
         rows = DB.execute("SELECT scope FROM bench_v2 WHERE tid=? AND until > ?",
-                          (tid, time.time())).fetchall()
+                          (tid, now)).fetchall()
     scopes = {r[0] for r in rows}
     return "shared" if "shared" in scopes else ("strategy" if scopes else None)
 
 
-def sit(tid: str, reason: str, scope: str = "shared"):
-    mins = BENCH_MINUTES.get(reason.split(":")[0], DEFAULT_BENCH)
+def bench_minutes(reason: str) -> float:
+    return BENCH_MINUTES.get(reason.split(":")[0], DEFAULT_BENCH)
+
+
+def sit(tid: str, reason: str, scope: str = "shared", now: float | None = None):
+    now = time.time() if now is None else now
     with _lock:
         DB.execute("INSERT OR REPLACE INTO bench_v2 VALUES (?,?,?,?)",
-                   (tid, scope, reason, time.time() + mins * 60))
-        DB.execute("DELETE FROM bench_v2 WHERE until < ?", (time.time(),))
+                   (tid, scope, reason, now + bench_minutes(reason) * 60))
+        DB.execute("DELETE FROM bench_v2 WHERE until < ?", (now,))
         DB.commit()
 
 

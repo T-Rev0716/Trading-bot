@@ -46,3 +46,18 @@ def test_token_is_cached_until_near_expiry(monkeypatch):
     monkeypatch.setattr(f, "_read_bearer", lambda tab: reads.append(1) or jwt(time.time() + 3600))
     t1, t2 = f.token(), f.token()
     assert t1 == t2 and len(reads) == 1
+
+
+def test_rows_under_response_object_are_found():
+    """regression: the live filterTokens proxy wraps its rows in `responseObject`.
+       Before that key was known, every lookup parsed as zero rows."""
+    payload = {"responseObject": [CODEX_ROW]}
+    rows = _results(payload)
+    assert rows == [CODEX_ROW]
+    assert _row(rows[0])["mcap"] == 310000
+
+
+def test_tokens_maps_rows_from_the_response_object_wrapper(monkeypatch):
+    f = Fomo()
+    monkeypatch.setattr(f, "filter_tokens", lambda ids: {"responseObject": [CODEX_ROW]})
+    assert set(f.tokens(["0xabc:56"])) == {"0xabc:56"}

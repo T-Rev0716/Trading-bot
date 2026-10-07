@@ -9,12 +9,24 @@ def _below(v, floor) -> bool:
     return v is None or v < floor
 
 
+def age_band(age) -> str:
+    """'missing', 'too_young', 'too_old' or 'in_range'. Three different situations: a
+       young token will become eligible, an old one never will, a missing one is unknown."""
+    if age is None:
+        return "missing"
+    if age < HARD["min_age_minutes"]:
+        return "too_young"
+    if age > HARD["max_age_hours"] * 60:
+        return "too_old"
+    return "in_range"
+
+
 def free_kill(t) -> str | None:
     """Pass one. Runs on the whole universe, costs nothing, touches no network.
        Everything it reads came back with the FOMO batch."""
-    age = t["age_minutes"]
-    if age is None or not HARD["min_age_minutes"] <= age <= HARD["max_age_hours"] * 60:
-        return "age"
+    band = age_band(t["age_minutes"])
+    if band != "in_range":
+        return f"age_{band}"
     if _below(t["liquidity_usd"], HARD["min_liquidity_usd"]):    return "liquidity"
     if _below(t["volume_h24"], HARD["min_volume_h24"]):          return "volume"
     m = t["mcap_usd"]

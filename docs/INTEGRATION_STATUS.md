@@ -4,6 +4,26 @@
 is no live order path. This page tracks whether each outside service has been checked
 against **real** responses. No integration is marked verified on made-up data.
 
+## Operator-reported local checks (after 2026-10-07)
+
+Reported from a local run, not re-run in the sandbox:
+
+| service | reported status |
+|---|---|
+| GeckoTerminal | OK |
+| Solana RPC (Helius) | OK |
+| Jev (TypeSafe) | OK |
+| FOMO token lookup | OK, after adding the observed `responseObject` wrapper to `fomo_api._results` (regression test in `tests/test_fomo.py`) |
+| DexScreener | not reported |
+
+The fixtures from that run are not in the repository yet, so
+`tests/test_fixtures_solana.py` still skips. Commit them to turn the parser checks on.
+
+**First real-data paper cycle:** 40 tokens seen, all 40 rejected on age, no orders. Its
+journal replay matched `paper.db` exactly, but with no orders it exercised none of the
+order lifecycle. Cause: discovery starvation, not the thresholds (see the README,
+"Discovery and the watchlist"). The thresholds were left unchanged.
+
 ## Last diagnostic: Claude Code cloud sandbox, 2026-10-07 (Solana only)
 
 | service | status | why |

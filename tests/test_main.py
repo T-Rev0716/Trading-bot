@@ -36,7 +36,7 @@ class Desk:
 def wired(monkeypatch):
     toks = [A, B]
     monkeypatch.setattr(main, "universe", lambda nets, pages: [t["tid"] for t in toks])
-    monkeypatch.setattr(main, "shortlist", lambda fomo, ids: [
+    monkeypatch.setattr(main, "shortlist", lambda fomo, ids, now=None: [
         {k: t[k] for k in ("addr", "net", "tid", "ticker", "chain", "token_key",
                            "mcap_usd", "liquidity_usd", "volume_h24", "price_usd",
                            "holder_count", "change", "age_minutes")} for t in toks])

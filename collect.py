@@ -45,18 +45,24 @@ def gt_get(path: str, **params) -> dict:
     return r.json()
 
 
-def age_minutes(created) -> float | None:
+def created_epoch(created) -> float | None:
     """createdAt comes back as epoch seconds or milliseconds depending on the row.
-       Unknown stays unknown: a missing launch time is not a fresh launch."""
+       Returns epoch seconds, or None. Unknown stays unknown."""
     if not created:
         return None
     try:
         c = float(created)
     except (TypeError, ValueError):
         return None
-    if c > 1e11:                                # milliseconds
-        c /= 1000
-    return max(0.0, (time.time() - c) / 60)
+    return c / 1000 if c > 1e11 else c          # milliseconds -> seconds
+
+
+def age_minutes(created, now: float | None = None) -> float | None:
+    """A missing launch time is not a fresh launch: None stays None."""
+    c = created_epoch(created)
+    if c is None:
+        return None
+    return max(0.0, ((time.time() if now is None else now) - c) / 60)
 
 
 def universe(nets=("solana", "bsc", "robinhood"), pages=2) -> list[str]:
@@ -89,7 +95,7 @@ def parse_new_pools(body: dict, net: str) -> list[str]:
     return out
 
 
-def normalise(tid: str, m: dict) -> dict:
+def normalise(tid: str, m: dict, now: float | None = None) -> dict:
     """FOMO's field names become the desk's field names, once, here.
        Every file downstream reads these names and only these."""
     addr, net = tid.split(":")
@@ -102,15 +108,17 @@ def normalise(tid: str, m: dict) -> dict:
             "change": {"5m": m["change"].get(300), "1h": m["change"].get(3600),
                        "4h": m["change"].get(14400), "12h": m["change"].get(43200),
                        "24h": m["change"].get(86400)},
-            "age_minutes": age_minutes(m["created"])}
+            "created_at": created_epoch(m["created"]),
+            "age_minutes": age_minutes(m["created"], now)}
 
 
-def shortlist(fomo: Fomo, ids: list[str]) -> list[dict]:
+def shortlist(fomo: Fomo, ids: list[str], now: float | None = None) -> list[dict]:
     """Pass one over everything FOMO knows. No network beyond FOMO itself:
-       one call per twenty tokens, and not a single request per token."""
+       one call per twenty tokens, and not a single request per token.
+       Every row is current: watched tokens are re-fetched here, never reused."""
     out = []
     for tid, m in fomo.tokens(ids).items():             # 20 per call
-        t = normalise(tid, m)
+        t = normalise(tid, m, now)
         if t["net"] in GT_NET:
             out.append(t)
     # turnover ranks the queue. It orders work, it does not decide anything

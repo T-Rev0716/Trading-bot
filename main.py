@@ -24,10 +24,12 @@ import time
 import book
 import eligibility
 import session
+from watchlist import Watchlist
 from collect import universe, shortlist, trade_counts, dossier, social_state, GT_PER_MINUTE
-from filter import free_kill, trade_kill
+from filter import age_band, free_kill, trade_kill
 from questions import STATE_FIELDS
 from sizing import intended_ticket
+from thresholds import HARD
 
 TICK_SECONDS  = 300         # RISK polls every 5 minutes
 SCAN_EVERY    = 3           # a scan every third poll: every 15 minutes
@@ -35,6 +37,8 @@ NETS          = ("solana", "bsc", "robinhood")
 PAGES         = 2           # 3 chains x 2 pages = 6 GT slots before the funnel starts
 GT_DOSSIER    = GT_PER_MINUTE - len(NETS) * PAGES     # what is left for dossiers: 4 at 10/min
 DEX_BUDGET    = 25          # DexScreener calls per cycle, pass two only
+WATCH_MAX     = 200         # watched tokens; re-fetching them costs one FOMO call per 20
+WATCH         = Watchlist(book.DB, HARD["max_age_hours"], WATCH_MAX, book._lock)
 log = logging.getLogger("desk")
 
 
@@ -47,35 +51,81 @@ def _count(stats, stage, reason):
     stats[stage][reason] = stats[stage].get(reason, 0) + 1
 
 
-def scan(fomo, judge, desk, free_cash: float, ask_judge: bool):
+def _ages(rows) -> dict:
+    """Observed ages by band, so a starved cycle says which way it is starved."""
+    out = {}
+    for band in ("missing", "too_young", "in_range", "too_old"):
+        ages = [t["age_minutes"] for t in rows if age_band(t["age_minutes"]) == band]
+        out[band] = {"n": len(ages)} if band == "missing" else \
+            {"n": len(ages), "min_minutes": round(min(ages), 1) if ages else None,
+             "max_minutes": round(max(ages), 1) if ages else None}
+    return out
+
+
+def _span(b) -> str:
+    return f"[{b['min_minutes']}-{b['max_minutes']} min]" if b["n"] else ""
+
+
+def scan(fomo, judge, desk, free_cash: float, ask_judge: bool, now: float | None = None,
+         watch: Watchlist | None = None):
     """The funnel. Returns ([(dossier, answers or None)], stats).
 
+    Discovery is the newest pools plus the watchlist, all re-fetched from FOMO now.
     Facts and data rules bench for everyone. Judge rejections bench for the strategy only,
-    so the baseline is never starved by a judgement it does not use. Judge failures
+    so the baseline is never starved by a judgement it does not use. A token too young
+    is watched, never benched, so it is looked at again once it matures. Judge failures
     propagate: a desk with no judge stands down, it does not guess."""
+    now = time.time() if now is None else now
+    watch = WATCH if watch is None else watch
     stats = {"seen": 0, "benched": 0, "free": {}, "trade": {}, "chain": {}, "soft": {},
-             "candidates": 0}
+             "deferred_budget": 0, "candidates": 0}
     cands = []
     gt_slots, dex_slots = GT_DOSSIER, DEX_BUDGET
 
-    for t in shortlist(fomo, universe(NETS, PAGES)):
+    expired = watch.prune(now)
+    discovered = universe(NETS, PAGES)
+    watched = watch.active(now)
+    fresh = set(discovered)
+    ids = list(dict.fromkeys(discovered + [w for w in watched if w not in fresh]))
+    rows = shortlist(fomo, ids, now)
+    returned = {t["tid"] for t in rows}
+    evicted = 0
+    stats["discovery"] = {"discovered": len(fresh), "watched": len(watched),
+                          "refetched_from_watchlist": len(ids) - len(fresh),
+                          "requested": len(ids), "fomo_unknown": len(set(ids) - returned),
+                          "expired": expired}
+    stats["age"] = _ages(rows)
+
+    def reject(t, reason, stage, scope="shared"):
+        book.sit(t["tid"], reason, scope, now)
+        _count(stats, stage, reason)
+        if scope == "shared" and book.bench_minutes(reason) >= HARD["max_age_hours"] * 60:
+            watch.drop(t["tid"])                 # a permanent fact: stop watching
+
+    for t in rows:
         stats["seen"] += 1
-        scope = book.benched(t["tid"])
+        if age_band(t["age_minutes"]) == "too_old":
+            watch.drop(t["tid"])
+        else:
+            evicted += watch.observe(t["tid"], t.get("created_at"), now)
+        scope = book.benched(t["tid"], now)
         if scope == "shared":
             stats["benched"] += 1
             continue
         if (k := free_kill(t)):
-            book.sit(t["tid"], k)
-            _count(stats, "free", k)
+            if k == "age_too_young":
+                _count(stats, "free", k)         # watched, not benched
+            else:
+                reject(t, k, "free")
             continue
         if dex_slots <= 0 or gt_slots <= 0:
-            break                                # out of budget, not out of ideas
+            stats["deferred_budget"] += 1        # still watched: next cycle, not never
+            continue
 
         t |= trade_counts(t)
         dex_slots -= 1
         if (k := trade_kill(t)):
-            book.sit(t["tid"], k)
-            _count(stats, "trade", k)
+            reject(t, k, "trade")
             continue
 
         gt_slots -= 1                            # a failed call still costs the slot
@@ -83,14 +133,13 @@ def scan(fomo, judge, desk, free_cash: float, ask_judge: bool):
             d = dossier(t)
         except Exception as e:
             log.warning("dossier failed %s: %s", t["token_key"], e)
-            book.sit(t["tid"], "dossier_failed")
+            reject(t, "dossier_failed", "chain")
             continue
         d["x_account"] = desk.read_x(d["x_handle"]) if d["x_handle"] else None
 
         v = eligibility.check(d)                 # facts + missing-data policy, both ledgers
         if not v.ok:
-            book.sit(t["tid"], v.reason)
-            _count(stats, "chain", v.reason)
+            reject(t, v.reason, "chain")
             continue
 
         ans = None
@@ -103,11 +152,18 @@ def scan(fomo, judge, desk, free_cash: float, ask_judge: bool):
                 ans |= judge("social", social_state(d))["answers"]
             sv = eligibility.check(d, ans)
             if not sv.ok:
-                book.sit(t["tid"], sv.reason, scope="strategy")
-                _count(stats, "soft", sv.reason)
+                reject(t, sv.reason, "soft", scope="strategy")
         cands.append((d, ans))
 
     stats["candidates"] = len(cands)
+    stats["discovery"] |= {"evicted": evicted, "watchlist_size": watch.size()}
+    a = stats["age"]
+    log.info("scan: %d discovered + %d re-fetched from watchlist; ages: %d missing, "
+             "%d too young %s, %d in range %s, %d too old %s; %d deferred by budget",
+             len(fresh), len(ids) - len(fresh), a["missing"]["n"],
+             a["too_young"]["n"], _span(a["too_young"]), a["in_range"]["n"],
+             _span(a["in_range"]), a["too_old"]["n"], _span(a["too_old"]),
+             stats["deferred_budget"])
     return cands, stats
 
 
