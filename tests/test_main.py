@@ -1,113 +1,130 @@
 import json
+import subprocess
+import sys
 
 import pytest
 
 import book
 import main
-from judge_client import JudgeUnavailable
+from tests.conftest import ROOT
+from tests.helpers import answers, dossier, engines, quote
+from venue import FaultPlan
+
+A = dossier(addr="MintA1111111111111111111111111111111111111", ticker="AAA")
+B = dossier(addr="MintB1111111111111111111111111111111111111", ticker="AAA",
+            buys_h1=90, sells_h1=10)
 
 
-def fomo_token(tid, ticker):
-    addr, net = tid.split(":")
-    return {"addr": addr, "net": int(net), "tid": tid, "ticker": ticker,
-            "mcap_usd": 400_000, "liquidity_usd": 60_000, "volume_h24": 300_000,
-            "price_usd": 0.001, "holder_count": 500, "change": {"1h": 0.1},
-            "age_minutes": 90}
+class Fomo:
+    def token(self):
+        return "t"
 
 
 class Desk:
-    def __init__(self, x=None):
-        self.shadow, self.x = [], x
+    def __init__(self):
+        self.reports = []
 
     def read_x(self, handle):
-        return self.x
+        return {"handle": handle}
 
-    def log_shadow(self, order, stats):
-        json.dumps(order, default=str)
-        self.shadow.append(order)
-
-
-GOOD = {
-    "market": {"shape": {"type": "choice", "choice": "crowd", "confidence": 0.8,
-                         "probabilities": {"crowd": 0.8, "one_buyer": 0.1, "fading": 0.05,
-                                           "too_early": 0.05}},
-               "liquidity_fits_ticket": {"type": "noul", "noul": 0.9},
-               "momentum_already_spent": {"type": "noul", "noul": 0.2}},
-    "solana": {"authority_risk": {"type": "choice", "choice": "renounced", "confidence": 0.9,
-                                  "probabilities": {"renounced": 0.9}},
-               "concentration_is_exit_risk": {"type": "noul", "noul": 0.1},
-               "dev_still_loaded": {"type": "noul", "noul": 0.1}},
-    "social": {"account_is_the_project": {"type": "noul", "noul": 0.95},
-               "audience_is_real": {"type": "noul", "noul": 0.8},
-               "recycled_account": {"type": "noul", "noul": 0.05},
-               "effort": {"type": "score", "score": 2.0}},
-}
+    def report(self, what):
+        self.reports.append(what)
 
 
 @pytest.fixture
 def wired(monkeypatch):
-    toks = [fomo_token("Mint1:1399811149", "AAA"), fomo_token("Mint2:1399811149", "AAA"),
-            dict(fomo_token("Mint3:1399811149", "OLD"), age_minutes=10_000)]
+    toks = [A, B]
     monkeypatch.setattr(main, "universe", lambda nets, pages: [t["tid"] for t in toks])
-    monkeypatch.setattr(main, "shortlist", lambda fomo, ids: [dict(t) for t in toks])
+    monkeypatch.setattr(main, "shortlist", lambda fomo, ids: [
+        {k: t[k] for k in ("addr", "net", "tid", "ticker", "chain", "token_key",
+                           "mcap_usd", "liquidity_usd", "volume_h24", "price_usd",
+                           "holder_count", "change", "age_minutes")} for t in toks])
     monkeypatch.setattr(main, "trade_counts", lambda t: {
-        "buys_h1": 50, "sells_h1": 30, "buys_h6": 300, "sells_h6": 200, "trades_h24": 900,
-        "volume_h1": 1, "volume_h6": 6})
+        k: next(x for x in toks if x["tid"] == t["tid"])[k]
+        for k in ("buys_h1", "sells_h1", "buys_h6", "sells_h6", "trades_h24",
+                  "volume_h1", "volume_h6")})
     monkeypatch.setattr(main, "dossier", lambda t: {
-        **t, "chain": "solana", "top_10_share": 0.3, "top_wallet_share": 0.02,
-        "mint_authority_open": False, "freeze_authority_open": False, "is_honeypot": None,
-        "developer_holding_percentage": None, "gt_score_details": None,
-        "description": "d", "x_handle": "coin"})
-    return toks
+        **next(x for x in toks if x["tid"] == t["tid"]), **t})
 
 
-def make_judge(winner_index=0, log=None):
+def judge_for(calls):
     def judge(qs, state):
-        if log is not None:
-            log.append((qs, state))
+        calls.append(qs)
         if qs == "pick":
             labels = [c["label"] for c in state["candidates"]]
-            return {"model": "jev-1.13.0", "answers": {
-                "best": {"choice": labels[winner_index], "confidence": 0.8,
-                         "probabilities": {l: 0.8 if i == winner_index else 0.2
-                                           for i, l in enumerate(labels)}},
-                "worth_trading_at_all": {"noul": 0.9}}}
-        return {"model": "jev-1.13.0", "answers": GOOD[qs]}
+            ans = {"worth_trading_at_all": {"type": "noul", "noul": 0.9}}
+            if len(labels) > 1:
+                ans["best"] = {"type": "choice", "choice": labels[0], "confidence": 0.8,
+                               "probabilities": {l: 0.8 if i == 0 else 0.2
+                                                 for i, l in enumerate(labels)}}
+            return {"model": "jev-test", "answers": ans}
+        full = answers(A)
+        from questions import SETS
+        return {"model": "jev-test", "answers": {k: full[k] for k in SETS[qs]}}
     return judge
 
 
-def test_shadow_cycle_picks_logs_and_never_takes_the_book(wired):
-    desk, log = Desk(x={"handle": "coin"}), []
-    order, stats = main.run_once(None, make_judge(1, log), desk, bank=1000, shadow=True)
-    assert order is None and book.held() is None
-    assert stats["free"] == {"age": 1} and stats["survivors"] == 2
-    assert desk.shadow[0]["token"]["address"] == "Mint2"       # same ticker, right token
-    assert desk.shadow[0]["size_factor"] == 1.0
-    assert book.benched("Mint3:1399811149")
-    market_state = next(s for q, s in log if q == "market")
-    assert market_state["intended_ticket_usd"] == 60.0
-    assert "description" not in market_state and "x_account" not in market_state
+def test_cycle_enters_both_ledgers_and_writes_the_tape(wired, tmp_path):
+    eng, market, clock = engines()
+    for d in (A, B):
+        market.update(d["token_key"], quote())
+    calls, tape = [], tmp_path / "tape.jsonl"
+    out = main.run_cycle(Fomo(), judge_for(calls), Desk(), eng, str(tape), now=clock())
+    assert out["strategy"]["entry"]["status"] == "FILLED"
+    assert out["baseline"]["entry"]["status"] == "FILLED"
+    assert out["baseline"]["choice"] == f"AAA ({B['token_key']})"     # higher buy share
+    assert calls.count("market") == 2 and calls.count("pick") == 1
+    row = json.loads(tape.read_text().splitlines()[0])
+    assert row["type"] == "cycle" and len(row["candidates"]) == 2
+    assert row["pick"]["labels"] == [f"AAA ({A['token_key']})", f"AAA ({B['token_key']})"]
+    # both ledgers hold: the next cycle does not scan at all
+    calls.clear()
+    out = main.run_cycle(Fomo(), judge_for(calls), Desk(), eng, str(tape), now=clock())
+    assert out == {"skipped": {"strategy": "position_open", "baseline": "position_open"}}
+    assert calls == []
 
 
-def test_live_cycle_takes_the_book_and_next_cycle_does_not_scan(wired):
-    order, _ = main.run_once(None, make_judge(), Desk(), bank=1000, shadow=False)
-    assert order["size_factor"] == 0.6                          # no X account
-    assert book.held()["ticker"] == "AAA"
-    order2, stats = main.run_once(None, make_judge(), Desk(), bank=1000, shadow=False)
-    assert order2 is None and stats["held"] == "AAA"
+def test_unknown_order_blocks_the_strategy_but_not_the_baseline(wired):
+    eng, market, clock = engines(faults=FaultPlan(timeout_after_fill={1}))
+    for d in (A, B):
+        market.update(d["token_key"], quote())
+    calls = []
+    out = main.run_cycle(Fomo(), judge_for(calls), Desk(), eng, now=clock())
+    assert out["strategy"]["entry"]["status"] == "UNKNOWN"
+    assert out["baseline"]["entry"]["status"] == "FILLED"
+    eng["baseline"].ledger.db.execute("DELETE FROM positions WHERE ledger='baseline'")
+    book.DB.execute("DELETE FROM bench_v2")
+    calls.clear()
+    out = main.run_cycle(Fomo(), judge_for(calls), Desk(), eng, now=clock() + 900)
+    assert out["blocked"]["strategy"] == "unknown_order"
+    assert calls == []                                    # no judge spend while blocked
+    assert "strategy" not in out                          # no strategy entry attempted
 
 
-def test_single_survivor_skips_pick_but_keeps_size_cuts(wired, monkeypatch):
-    log = []
-    wired[1]["age_minutes"] = 5                                 # killed by age
-    order, stats = main.run_once(None, make_judge(log=log), Desk(), bank=1000, shadow=False)
-    assert order["confidence"] is None and order["size_factor"] == 0.6
-    assert all(q != "pick" for q, _ in log)
-
-
-def test_judge_down_stands_the_cycle_down(wired):
+def test_judge_rejection_benches_for_the_strategy_only(wired):
+    eng, market, clock = engines()
     def judge(qs, state):
-        raise JudgeUnavailable("down")
-    with pytest.raises(JudgeUnavailable):
-        main.run_once(None, judge, Desk(), bank=1000, shadow=False)
-    assert book.held() is None
+        r = judge_for([])(qs, state)
+        if qs == "market":
+            r["answers"]["momentum_already_spent"] = {"type": "noul", "noul": 0.99}
+        return r
+    market.update(A["token_key"], quote())
+    market.update(B["token_key"], quote())
+    out = main.run_cycle(Fomo(), judge, Desk(), eng, now=clock())
+    assert out["stats"]["soft"] == {"momentum_already_spent": 2}
+    assert book.benched(A["tid"]) == "strategy"
+    assert out["baseline"]["entry"]["status"] == "FILLED"
+
+
+def test_live_flag_is_refused(tmp_path):
+    r = subprocess.run([sys.executable, "main.py", "--live"], cwd=ROOT,
+                       capture_output=True, text=True,
+                       env={"PATH": "/usr/bin:/bin", "DESK_DB": str(tmp_path / "d.db")})
+    assert r.returncode == 1 and "Live execution is disabled" in r.stderr
+
+
+def test_there_is_no_order_delivery_code():
+    import desk
+    assert not hasattr(desk.Desk, "send_to_seats")
+    src = "".join(open(f"{ROOT}/{f}").read() for f in ("main.py", "desk.py", "paper.py"))
+    assert "SEATS_WEBHOOK_URL" not in src

@@ -6,3 +6,6 @@ desk.db-*
 shadow.jsonl
 .pytest_cache/
 .venv/
+paper.db
+paper.db-*
+paper_tape.jsonl

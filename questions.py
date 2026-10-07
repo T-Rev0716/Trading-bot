@@ -128,20 +128,24 @@ SOCIAL = {
 
 def PICK(state):
     """Options built from the shortlist at call time. Choice takes up to 255.
-       Labels are unique per candidate: two launches sharing a ticker is common."""
-    return {
-        "best": Choice(
-            instructions="Choose the single token in `candidates` that is the best entry "
-                         "right now. Weigh crowd shape, contract risk, concentration and "
-                         "the project account together. Prefer a clean unspent setup over "
-                         "a larger move that already happened.",
-            criteria={c["label"]: c["summary"] for c in state["candidates"]}),
+       Labels carry the full chain:address, since two launches often share a ticker.
+       With one candidate there is nothing to choose between, so only the absolute
+       gate is asked: the same gate a field of many has to pass."""
+    qs = {
         "worth_trading_at_all": Noul(
             instructions="At least one token in `candidates` is worth a position today, "
                          "rather than all of them being mediocre.",
             criteria={"true": "At least one is a clean setup.",
                       "false": "Every candidate has a disqualifying weakness."}),
     }
+    if len(state["candidates"]) >= 2:
+        qs["best"] = Choice(
+            instructions="Choose the single token in `candidates` that is the best entry "
+                         "right now. Weigh crowd shape, contract risk, concentration and "
+                         "the project account together. Prefer a clean unspent setup over "
+                         "a larger move that already happened.",
+            criteria={c["label"]: c["summary"] for c in state["candidates"]})
+    return qs
 
 
 SETS = {"market": MARKET, "social": SOCIAL, "pick": PICK,

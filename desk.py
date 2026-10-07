@@ -1,18 +1,14 @@
-"""The Grok Bot side of the shift, as main.py sees it.
+"""The desk's outside world, as main.py sees it: X reads and reports.
 
-main.py needs five things from the desk. This default wires them to environment
-variables so the shift runs on its own; swap any method for your own integration.
+There is no order delivery here. Live execution is disabled; orders go to the paper
+venue in venue.py and nowhere else.
 
-    DESK_BANK_USD        free cash the shift sizes against            (required)
     X_READER_URL         SOCIAL's endpoint: POST {"handle"} -> X block or null
-    SEATS_WEBHOOK_URL    where a live order is POSTed for SIZE -> FILLS -> RISK
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   one line per cycle, trade or no trade
-    SHADOW_LOG           shadow week rows, default shadow.jsonl
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   one message per cycle and per exit
 """
 import json
 import logging
 import os
-import time
 
 import requests
 
@@ -22,10 +18,6 @@ log = logging.getLogger("desk")
 class Desk:
     def __init__(self):
         self.secret = os.environ.get("DESK_SECRET", "")
-        self.shadow_path = os.environ.get("SHADOW_LOG", "shadow.jsonl")
-
-    def bank(self) -> float:
-        return float(os.environ["DESK_BANK_USD"])
 
     def read_x(self, handle: str):
         """The X block SOCIAL collects with its plugin, or None. Never a guess."""
@@ -42,36 +34,10 @@ class Desk:
             return None
         return block.get("x_account", block) if isinstance(block, dict) else None
 
-    def log_shadow(self, order, stats):
-        with open(self.shadow_path, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "order": order, "stats": stats},
-                               default=str) + "\n")
-
-    def report(self, order, stats, note: str = ""):
-        if order:
-            t = order["token"]
-            line = (f"ORDER {t['ticker']} {t['chain']} {t['address']} "
-                    f"size_factor {order['size_factor']} conf {order['confidence']} "
-                    f"model {order['model']}")
-        elif stats.get("held"):
-            line = f"holding {stats['held']} for {stats['minutes']} min, no scan"
-        else:
-            line = (f"no trade{': ' + note if note else ''}. seen {stats.get('seen', 0)}, "
-                    f"benched {stats.get('benched', 0)}, free {stats.get('free', {})}, "
-                    f"trade {stats.get('trade', {})}, chain {stats.get('chain', {})}, "
-                    f"soft {stats.get('soft', {})}")
+    def report(self, what):
+        line = what if isinstance(what, str) else json.dumps(what, default=str)
         log.info(line)
-        self._telegram(line)
-
-    def send_to_seats(self, order):
-        """Hand it to SIZE, then FILLS, then RISK. Raises if nobody received it."""
-        url = os.environ.get("SEATS_WEBHOOK_URL")
-        if not url:
-            raise RuntimeError("SEATS_WEBHOOK_URL is not set, the order has nowhere to go")
-        r = requests.post(url, json=order, timeout=30,
-                          headers={"Authorization": f"Bearer {self.secret}"})
-        r.raise_for_status()
-        self._telegram(json.dumps(order, indent=1, default=str)[:4000])
+        self._telegram(line[:4000])
 
     def _telegram(self, text: str):
         tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")

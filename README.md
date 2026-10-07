@@ -1,8 +1,15 @@
-# The desk
+# The desk (paper only)
 
-A memecoin desk where Jev (TypeSafe) makes every judgement, code does every number, and
-Grok Bot seats size, fill and exit. Built from the "build the desk" guide, with the bugs
-in it fixed (listed at the bottom).
+A memecoin desk where Jev (TypeSafe) makes the judgements and Python does every number,
+every size, every fill and every exit, **on paper**. Live execution is disabled: there
+is no code path to a real venue, and `python main.py --live` exits with an error.
+
+Two ledgers trade side by side on the same candidates, the same simulated venue, the
+same sizing and the same exits:
+
+- **strategy**: Jev's answers, the SOFT gates, the pick.
+- **baseline**: rules only, no judge. If the strategy cannot beat this, the judge is not
+  adding anything.
 
 ```
 0. UNIVERSE  GeckoTerminal new_pools, 3 chains          -> fresh launches
@@ -10,24 +17,38 @@ in it fixed (listed at the bottom).
 2. FREE CUT  age, liquidity, volume, mcap. No network   -> tens
 3. TRADE CUT DexScreener buys and sells, one per token  -> a handful
 4. DOSSIER   GeckoTerminal info + chain RPC + X         -> four per cycle
-5. JUDGE     market + chain + social per token          -> scored shortlist
-6. PICK      one choice over the shortlist              -> one token, or none
+5. ELIGIBLE  facts + missing-data policy (both ledgers) -> candidates
+6. JUDGE     market + chain + social per token          -> strategy only
+7. SELECT    strategy: pick gates   baseline: rules     -> one token each, or none
+8. PAPER     size, simulated fill, poll, exit           -> ledgers, report
 ```
 
-| file              | what it is                                                       |
-|-------------------|------------------------------------------------------------------|
-| `judge.py`        | the only holder of the Jev key. `/judge`, `/book/held`, `/book/release` |
-| `judge_client.py` | how the shift and the bots call the judge                        |
-| `questions.py`    | every question the desk can ask, and the fields each set reads   |
-| `collect.py`      | universe, shortlist, trade counts, dossier                       |
-| `fomo_api.py`     | FOMO client, Privy bearer read out of Chrome over CDP            |
-| `thresholds.py`   | every number. Retune here and nowhere else                       |
-| `filter.py`       | the order the kills fire in                                      |
-| `pick.py`         | CHIEF's pick and size factor                                     |
-| `book.py`         | one position at a time, and the bench                            |
-| `desk.py`         | the Grok Bot side: bank, X reads, shadow log, Telegram, seats    |
-| `main.py`         | the shift                                                        |
-| `prompts/`        | HANDOFF, SOCIAL, and SIZE / FILLS / RISK prompts for the bots    |
+| file              | what it is                                                        |
+|-------------------|-------------------------------------------------------------------|
+| `judge.py`        | the only holder of the Jev key. `/judge` only                     |
+| `judge_client.py` | how the shift calls the judge                                     |
+| `questions.py`    | every question the desk can ask, and the fields each set reads    |
+| `collect.py`      | universe, shortlist, trade counts, dossier                        |
+| `fomo_api.py`     | FOMO client, Privy bearer read out of Chrome over CDP             |
+| `ids.py`          | token identity: `chain:full_address`, never a ticker              |
+| `thresholds.py`   | every number, including missing-data, sizing, exit and paper settings |
+| `filter.py`       | the funnel's kills, in order                                      |
+| `eligibility.py`  | the one eligibility check every candidate goes through            |
+| `pick.py`         | the strategy's selection and its gates                            |
+| `baseline.py`     | the rules-only selection                                          |
+| `cycle.py`        | entries for one cycle, shared by the shift and replay             |
+| `sizing.py`       | SIZE, enforced in Python                                          |
+| `exits.py`        | RISK, enforced in Python                                          |
+| `venue.py`        | the simulated venue: deterministic fills, fees, slippage, faults  |
+| `ledger.py`       | cash, orders, positions, marks; the order lifecycle               |
+| `paper.py`        | the engine tying ledger, venue and market together                |
+| `market.py`       | quotes: live DexScreener, replay, and a tape recorder             |
+| `report.py`       | performance per ledger, side by side                              |
+| `replay.py`       | re-run a recorded tape through both ledgers                       |
+| `book.py`         | the bench, scoped shared or strategy-only                         |
+| `desk.py`         | X reads and Telegram reports. No order delivery                   |
+| `main.py`         | the paper shift                                                   |
+| `prompts/`        | the bot prompts, kept for reference. Not wired to anything        |
 
 ## Setup
 
@@ -38,137 +59,145 @@ pip install -r requirements.txt
 cp .env.example .env        # fill it in, then: set -a; . ./.env; set +a
 ```
 
-1. **Jev key.** console.typesafe.ai -> Keys. Put it in `TYPESAFE_API_KEY` on the judge
-   machine only. Prove it works before anything else:
+1. **Jev key** in `TYPESAFE_API_KEY` on the judge machine. Prove it with the curl in
+   `prompts/HANDOFF.md`.
+2. **Desk secret:** `export DESK_SECRET="$(openssl rand -hex 24)"`.
+3. **Judge:** `uvicorn judge:app --host 127.0.0.1 --port 8080`, and
+   `JUDGE_URL=http://127.0.0.1:8080/judge` for the shift.
+4. **FOMO session:** start Chrome with `--remote-debugging-port=9222
+   --user-data-dir="$HOME/.fomo-chrome"`, log into fomo.family, then check the parser:
+   `python fomo_api.py probe <address>:1399811149`.
+5. **Run on paper:** `python main.py --once`, then `python main.py`. It polls every 5
+   minutes and scans every 15.
+6. **Read it:** `python report.py` for both ledgers. `python replay.py paper_tape.jsonl`
+   re-runs the recorded tape (useful after retuning `thresholds.py`).
+7. **Tests:** `pip install -r requirements-dev.txt && pytest -q`.
 
-   ```bash
-   curl -X POST https://api.typesafe.ai/v1/systemone \
-     -H "Authorization: Bearer $TYPESAFE_API_KEY" -H "Content-Type: application/json" \
-     -d '{"state":"payouts have been failing for 3 days","model":"jev-latest",
-          "questions":{"urgent":{"type":"noul","instructions":"This conveys urgency"}}}'
-   ```
+## The paper engine
 
-2. **Desk secret.** `export DESK_SECRET="$(openssl rand -hex 24)"`. The bots get this,
-   never the Jev key.
+**Fills** (`venue.simulate_fill`) are a pure function of side, reference price, pool
+liquidity and size:
 
-3. **Judge.**
+```
+slippage_bps = base_slippage_bps + impact_bps_per_pct_of_pool * (size / liquidity * 100)
+buy:   price = ref * (1 + slip);  spends the ticket on tokens, fee on top
+sell:  price = ref * (1 - slip);  sells the whole position, fee out of proceeds
+fee    = max(0.45% * notional, $0.95) per side
+```
 
-   ```bash
-   uvicorn judge:app --host 0.0.0.0 --port 8080
-   cloudflared tunnel --url http://localhost:8080    # bots run in xAI's cloud
-   ```
+Slippage over `max_slippage_bps` completes and is flagged `slippage_over_max`, as FILLS
+specifies. No price or no liquidity: the venue rejects.
 
-   Bots use `JUDGE_URL=https://<tunnel>/judge` and `BOOK_RELEASE_URL=https://<tunnel>/book/release`.
-   Run the judge and the shift from the same directory (or the same `DESK_DB`) so
-   `/book/release` frees the book the shift reads.
+**Sizing** (`sizing.ticket`), the four SIZE steps: `kelly_fraction` of free cash, clamped
+at 6%; times the size factor; at most 2% of the pool; zero if one side's fee is over 1%
+of the ticket. Free cash is the ledger's cash minus whatever unsettled buys reserved.
+`kelly_fraction` is a **placeholder (3%)**: there is no measured edge yet.
 
-4. **FOMO session.** Start Chrome with a dedicated profile and a debugging port, log
-   into fomo.family once, leave the window open:
+**Exits** (`exits.decide`), polled every 5 minutes:
+- `volume_h6 / (volume_h24 / 4) < 0.20` closes.
+- No quote after two retries closes **blind**, priced at the last price minus a 25%
+  haircut, so missing data never flatters the paper results.
+- Missing or zero volume closes: a position you cannot measure is one you do not hold.
+- Optional stop-loss, take-profit and max hold, all off by default.
 
-   ```bash
-   google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.fomo-chrome"
-   ```
+**Order lifecycle** (`ledger.py`):
 
-   Chrome 136+ refuses remote debugging on your default profile, hence the separate
-   `--user-data-dir`. Then check the parser against the real API:
+```
+NEW -> SUBMITTED -> FILLED | REJECTED | UNKNOWN
+UNKNOWN -> FILLED | REJECTED     only through reconciliation against the venue's record
+```
 
-   ```bash
-   python fomo_api.py probe <address>:1399811149
-   ```
+- Every order has a unique id and a unique idempotency key
+  (`ledger:buy:chain:address:cycle` or `ledger:sell:position:attempt`). A repeat is
+  refused. The venue never fills the same order id twice.
+- A delivery timeout is **UNKNOWN, never failed**. The buy's cash stays reserved, a
+  closing position stays `CLOSING`, and that ledger refuses every new order until
+  reconciliation settles it. The venue saying "never received" only counts after a
+  120 s grace period. A venue that cannot be asked keeps the order UNKNOWN indefinitely.
+- An order found `SUBMITTED` at startup (a crash mid-send) is treated as UNKNOWN. An order
+  still `NEW` was never handed over and is rejected as `never_sent`.
+- A position records the buy that opened it. It can only be released by a filled sell
+  created for that same position, on the same token and ledger. Anything else raises
+  `ReleaseMismatch`. A rejected close puts the position back to `OPEN`.
+- One position per ledger at a time. While both ledgers hold, the shift does not scan.
 
-   The parsed row's mcap, liquidity, holders and change must match the site. If they
-   do not, fix `_row` in `fomo_api.py` before anything else.
+**Eligibility** (`eligibility.check`) is the same for one survivor or many: facts, then
+the missing-data policy, then (strategy only) every required judge answer and the SOFT
+gates. The strategy's pick then applies `worth_trading_at_all >= 0.60` whether there is
+one candidate or ten. With one candidate the choice question is not asked, because a
+choice over one option is certain by construction (confidence 1.0), so the absolute gate
+decides, exactly as it does for many.
 
-5. **Bots.** Paste `prompts/HANDOFF.md` above SCAN, VET, SOCIAL and CHIEF. Paste
-   `prompts/SOCIAL.md` and `prompts/SEATS.md` into their seats. Fill in the four values
-   the guide never defines (table in `prompts/SEATS.md`). Prove the judge link from a
-   bot's own terminal with the curl in `prompts/HANDOFF.md`.
+**Missing risk data** (`thresholds.MISSING_DATA`): every risk field has a written rule
+per chain: `reject`, `("cut", f)` or `allow`. The rules are conservative defaults, so edit them
+deliberately:
 
-6. **Shadow week.**
+| field | solana | bsc / base | robinhood |
+|---|---|---|---|
+| price, liquidity, trades, holder_count | reject | reject | reject |
+| mint / freeze authority | reject | allow (n/a on EVM) | allow |
+| is_honeypot | allow (n/a) | reject | cut 0.5 |
+| top_10_share | cut 0.5 | cut 0.5 | cut 0.8 |
+| top_wallet_share | cut 0.5 | allow (no free source) | allow |
+| x_account | cut 0.6 | cut 0.6 | cut 0.6 |
+| developer_holding_percentage | allow | allow | allow |
 
-   ```bash
-   python main.py --once     # one cycle, check the log line
-   python main.py            # shadow: writes shadow.jsonl, never sends, never takes the book
-   ```
+Cuts stack: a dark Robinhood token with no X account trades at 0.5 × 0.8 × 0.6 = 0.24.
 
-   Read the rows each evening and tune `thresholds.py`. Then:
+**Identity** is `chain:full_address` everywhere (EVM addresses lowercased, Solana kept
+case-sensitive). Pick options read `TICKER (chain:address)`.
 
-   ```bash
-   python main.py --live     # needs SEATS_WEBHOOK_URL so the order reaches SIZE
-   ```
+## Strategy vs baseline
 
-7. **Tests.** `pip install -r requirements-dev.txt && pytest -q`. The judge tests run
-   every question set through the real `typesafe-sdk` against a mocked endpoint.
+`python replay.py examples/synthetic_tape.jsonl`:
 
-## Failure handling
+```
+                     strategy     baseline
+return_pct              0.951       -1.845
+realized_pnl            95.14      -184.48
+closed_trades               1            1
+win_rate                  1.0          0.0
+max_drawdown_pct        0.187        1.858
+```
 
-| what                    | what the desk does                                            |
-|-------------------------|---------------------------------------------------------------|
-| GeckoTerminal 10/min    | `collect.gt_get` waits for a slot instead of earning a 429    |
-| DexScreener 429         | the token reads as no pair. Lower `DEX_BUDGET` if it repeats  |
-| Jev 429 / 5xx           | the SDK retries with backoff. Leave it alone                  |
-| Jev 422                 | the shift stops: every token would hit the same wall          |
-| judge unreachable       | the cycle stands down. No fallback to guessing                |
-| dossier throws          | that token is benched 30 min. Not a pass, not a retry loop    |
-| FOMO bearer expires     | refreshed at the top of every cycle by reloading the tab      |
-| seats webhook fails     | the book is released, since nobody got the order              |
+**This proves nothing about edge.** The synthetic tape is rigged by construction (the
+trap token looks better to the rules and worse to the judge) to show the comparison
+machinery working. Real evidence needs weeks of `paper_tape.jsonl` from live data.
 
-`python book.py` shows what is held, `python book.py release` frees it by hand.
+## Integration status
 
-## The bill
-
-`cost_per_call = (state_tokens + question_tokens) / 1_000_000 * 0.042`. At most four
-tokens reach the judge per cycle, three calls each plus one pick: about 13 calls of
-~1,400 tokens, roughly $0.0008 a cycle, under 8 cents a day at 96 cycles.
+| integration | status | what that means |
+|---|---|---|
+| `typesafe-sdk` 0.7.2 | **verified (offline)** | Package inspected and installed. Every question set goes through the real SDK client against a mocked HTTP endpoint in the tests. |
+| TypeSafe / Jev API | **mocked** | No key here. Never called. Answers in all tests are fabricated. |
+| Paper venue, ledger, sizing, exits, replay, report | **verified** | Built here, deterministic, covered by tests including fault injection. |
+| GeckoTerminal | **mocked** | Blocked from this sandbox. Parsing matches the guide's field names; whether flags come back as booleans or `"yes"`/`"no"` is handled both ways but not observed. |
+| DexScreener | **mocked** | Not reachable here. Used for trade counts and for every paper quote. Robinhood's chainId (`robinhood`) is a guess. |
+| Solana public RPC | **mocked** | Standard JSON-RPC methods; the pool-exclusion logic is tested on fabricated accounts only. |
+| FOMO `/proxy/filterTokens` | **unfinished** | No public docs. The response parser is an assumption (Codex-style rows). Run the probe first. |
+| Privy bearer over Chrome CDP | **unfinished** | Assumes `localStorage['privy:token']`. Untested against a real browser. |
+| X reads (SOCIAL) | **unfinished** | `X_READER_URL` is an interface with nothing behind it. Without it every token takes the 0.6 cut. |
+| Telegram reports | **mocked** | Standard Bot API call, never exercised. |
+| Live order execution | **disabled** | Removed on purpose. No webhook, no seat delivery, no `/book/release` route. |
 
 ## What changed from the guide, and why
 
-Fixed, each with a test:
+- **Paper only.** Orders go to `venue.PaperVenue`. The SIZE/FILLS/RISK prompts are now
+  Python (`sizing.py`, `venue.py`, `exits.py`); the prompts are reference only.
+- **The guide's bank cannot trade.** At $1,500, 6% is $90 and the $0.95 fee floor is
+  only 1% from $95. The paper bank defaults to $10,000.
+- **Single survivors** used to skip both the pick gates and the size cuts. Now they go
+  through the same checks as everyone else.
+- **Missing data** is a written policy per field and chain, not an implicit pass.
+- **Identity** is the full chain:address. Pick labels used to be ticker plus 6 chars.
+- **Solana top wallet** skips pools and bonding curves, which otherwise failed every
+  token. **GeckoTerminal flags** read `"no"` as false. **DexScreener pairs** are
+  filtered to the token's chain. **Honeypot** applies on every chain that reports it.
+- **Fat state:** each judge call only carries the fields its questions read.
+- **Judge failures** stand the cycle down; a 422 stops the shift.
+- **Arithmetic:** 10 GT calls minus 6 leaves 4 dossiers. A $0.95 fee on $20 is 4.75%
+  per side, 9.5% round trip.
 
-- **Solana top wallet.** The largest token account on a fresh launch is the pool or the
-  bonding curve, so the guide's `top[0]` failed the 5% cap on nearly every token.
-  Accounts owned by a program or a known AMM authority are now skipped.
-- **GeckoTerminal flags.** GT may answer `"no"` / `"yes"` / `"unknown"` as strings. The
-  guide's `mint_authority or freeze_authority` reads `"no"` as truthy and would kill
-  every Solana token. All flags are normalised to `true` / `false` / `null` in
-  `collect.flag`.
-- **Duplicate tickers in pick.** Options were keyed by ticker, so two launches named
-  `PEPE` collapsed into one. Options are now `TICKER [chain:addr6]`.
-- **Single survivor skipped the size cuts.** It went out at `size_factor` 1.0 even with
-  dark data or no X account. Both paths now use `pick.size_factor`.
-- **Nulls passing.** `free_kill` compared `None` to numbers (a crash) and an unknown
-  launch time read as age 0. Missing data now fails the hard checks.
-- **DexScreener across chains.** An EVM address can exist on several chains, and the
-  guide took the deepest pair on any of them. Pairs are filtered to the token's chain.
-- **Honeypot on Base.** `chain_kill` only checked `chain == "bsc"`; it now applies to
-  any chain that reports a honeypot flag.
-- **Units.** `top_10_percent` was a percent and `top_wallet_percent` a fraction. Both
-  are now fractions, renamed `top_10_share` / `top_wallet_share`.
-- **Fat state.** The guide sent the whole dossier to every set despite its own rule.
-  `questions.STATE_FIELDS` limits each call to the fields its questions read; a test
-  checks every field a question names is actually sent.
-- **Judge failures.** The guide's code skipped the token and carried on, against its
-  own failure table. A 422 now stops the shift, an unreachable judge ends the cycle.
-- **Judge errors.** A 401 from TypeSafe (our key) was surfaced to bots as 401, which
-  reads as a bad desk secret. It is now 502.
-- **RISK had no way to call `book.release()`** from xAI's cloud. `judge.py` exposes
-  `POST /book/release` behind the desk secret.
-- **Arithmetic.** 10 GT calls a minute minus 6 for the universe leaves 4 dossiers, not
-  3 (`main.GT_DOSSIER` computes it). A $0.95 floor on $20 is 4.75% each way, 9.5% round
-  trip, not 4.75% round trip.
-- **Added** `authority_risk: unknown` and a `liquidity_usd` field on the order, which
-  SIZE step 3 needs.
-
-Not verifiable from here, check before going live:
-
-- **FOMO's `/proxy/filterTokens` response shape.** It has no public docs. The parser
-  assumes Codex-style rows (`token.address`, `marketCap`, `change5m`...). Run the probe.
-- **Privy storage key.** The bearer is read from `localStorage['privy:token']`.
-- **DexScreener's chainId for Robinhood.** Set to `robinhood` in `collect.DEX_CHAIN`.
-  If every Robinhood token dies as `no_pair`, the log will say which chain ids it saw.
-- **X reads and seat delivery.** The guide leaves how the shift reaches Grok Bot open.
-  `desk.py` uses `X_READER_URL` and `SEATS_WEBHOOK_URL`. Without an X reader every
-  token carries the no-social 0.60 cut.
-- **The four undefined seat numbers** in `prompts/SEATS.md`.
-
-This trades real money in very risky assets. Run the shadow week.
+This is a research tool for very risky assets. Paper results with simulated fills will
+look better than real ones: real pools move between quote and fill, and some honeypots
+only show on the sell.

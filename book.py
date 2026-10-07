@@ -1,4 +1,10 @@
-"""What the desk remembers between cycles: the open position and the bench.
+"""The bench: a rejected token stays rejected for a while, by what rejected it.
+
+Positions and orders live in the paper ledger (ledger.py), not here.
+
+Scopes keep the strategy-versus-baseline comparison fair:
+  shared     a fact or a data rule both ledgers apply. Nobody sees the token.
+  strategy   a judge answer rejected it. The baseline, which never asks, still can.
 
 Creates desk.db on first run. DESK_DB overrides the path.
 """
@@ -10,13 +16,11 @@ import time
 
 DB = sqlite3.connect(os.environ.get("DESK_DB", "desk.db"), check_same_thread=False)
 DB.executescript("""
-CREATE TABLE IF NOT EXISTS position(
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  ticker TEXT, addr TEXT, net INT, opened_at REAL);
-CREATE TABLE IF NOT EXISTS bench(
-  tid TEXT PRIMARY KEY, reason TEXT, until REAL);
+CREATE TABLE IF NOT EXISTS bench_v2(
+  tid TEXT, scope TEXT CHECK (scope IN ('shared','strategy')), reason TEXT, until REAL,
+  PRIMARY KEY (tid, scope));
 """)
-_lock = threading.Lock()                # judge.py serves /book/release from threads
+_lock = threading.Lock()
 
 # how long a rejection stands, by what fired it
 BENCH_MINUTES = {
@@ -36,44 +40,26 @@ BENCH_MINUTES = {
 DEFAULT_BENCH = 45
 
 
-def held():
+def benched(tid: str) -> str | None:
+    """'shared', 'strategy', or None when the token is free to look at."""
     with _lock:
-        r = DB.execute("SELECT ticker, opened_at FROM position WHERE id=1").fetchone()
-    return {"ticker": r[0], "minutes": (time.time() - r[1]) / 60} if r else None
+        rows = DB.execute("SELECT scope FROM bench_v2 WHERE tid=? AND until > ?",
+                          (tid, time.time())).fetchall()
+    scopes = {r[0] for r in rows}
+    return "shared" if "shared" in scopes else ("strategy" if scopes else None)
 
 
-def take(order):
-    t = order["token"]
+def sit(tid: str, reason: str, scope: str = "shared"):
+    mins = BENCH_MINUTES.get(reason.split(":")[0], DEFAULT_BENCH)
     with _lock:
-        DB.execute("INSERT OR REPLACE INTO position VALUES (1,?,?,?,?)",
-                   (t["ticker"], t["address"], t["network_id"], time.time()))
-        DB.commit()
-
-
-def release():
-    """RISK calls this the moment a close is filled. Nothing else calls it."""
-    with _lock:
-        DB.execute("DELETE FROM position")
-        DB.commit()
-
-
-def benched(tid: str) -> bool:
-    with _lock:
-        r = DB.execute("SELECT until FROM bench WHERE tid=?", (tid,)).fetchone()
-    return bool(r and r[0] > time.time())
-
-
-def sit(tid: str, reason: str):
-    mins = BENCH_MINUTES.get(reason, DEFAULT_BENCH)
-    with _lock:
-        DB.execute("INSERT OR REPLACE INTO bench VALUES (?,?,?)",
-                   (tid, reason, time.time() + mins * 60))
-        DB.execute("DELETE FROM bench WHERE until < ?", (time.time(),))
+        DB.execute("INSERT OR REPLACE INTO bench_v2 VALUES (?,?,?,?)",
+                   (tid, scope, reason, time.time() + mins * 60))
+        DB.execute("DELETE FROM bench_v2 WHERE until < ?", (time.time(),))
         DB.commit()
 
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "held"
-    if cmd == "release":
-        release()
-    print(held())
+    for row in DB.execute("SELECT tid, scope, reason, until FROM bench_v2 WHERE until > ? "
+                          "ORDER BY until", (time.time(),)):
+        print(row[0], row[1], row[2], f"{(row[3] - time.time()) / 60:.0f} min left")
+    sys.exit(0)

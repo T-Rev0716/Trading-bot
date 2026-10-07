@@ -32,4 +32,5 @@ NEVER substitute a similar handle when the exact one returns nothing. Missing is
 
 The shift reaches this seat through `X_READER_URL` (see desk.py): a POST of
 `{"handle": "..."}` that answers with the block above, or null. Without it every token
-is treated as having no usable X account and carries the 0.60 ticket cut.
+is treated as having no usable X account and carries the `x_account` cut in
+`thresholds.MISSING_DATA` (0.60 by default).

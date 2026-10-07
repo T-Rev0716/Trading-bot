@@ -5,7 +5,6 @@ import pytest
 from fastapi.testclient import TestClient
 from typesafe_sdk import AsyncTypeSafeClient
 
-import book
 import judge
 
 AUTH = {"Authorization": "Bearer test-secret"}
@@ -69,11 +68,14 @@ def test_every_set_round_trips_through_the_sdk(api, qs):
 
 
 def test_pick_builds_options_from_state(api):
-    state = {"candidates": [{"label": "A [solana:aaa]", "summary": "s"},
-                            {"label": "A [solana:bbb]", "summary": "t"}]}
+    state = {"candidates": [{"label": "A (solana:aaa)", "summary": "s"},
+                            {"label": "A (solana:bbb)", "summary": "t"}]}
     r = api.post("/judge", json={"question_set": "pick", "state": state}, headers=AUTH)
     assert r.status_code == 200
-    assert r.json()["answers"]["best"]["choice"] in ("A [solana:aaa]", "A [solana:bbb]")
+    assert r.json()["answers"]["best"]["choice"] in ("A (solana:aaa)", "A (solana:bbb)")
+    one = {"candidates": state["candidates"][:1]}
+    r = api.post("/judge", json={"question_set": "pick", "state": one}, headers=AUTH)
+    assert set(r.json()["answers"]) == {"worth_trading_at_all"}
     bad = api.post("/judge", json={"question_set": "pick", "state": {}}, headers=AUTH)
     assert bad.status_code == 422
 
@@ -84,9 +86,6 @@ def test_upstream_422_is_passed_on(api):
     assert r.status_code == 422
 
 
-def test_book_routes(api):
-    book.take({"token": {"ticker": "T", "address": "a", "network_id": 56}})
-    assert api.get("/book/held", headers=AUTH).json()["held"]["ticker"] == "T"
-    assert api.post("/book/release").status_code == 401
-    assert api.post("/book/release", headers=AUTH).json()["released"]["ticker"] == "T"
-    assert book.held() is None
+def test_no_book_or_order_routes(api):
+    paths = {r.path for r in judge.app.routes}
+    assert not any(p.startswith("/book") for p in paths)

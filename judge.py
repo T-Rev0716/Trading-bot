@@ -13,7 +13,6 @@ from pydantic import BaseModel
 from typesafe_sdk import (AsyncTypeSafeClient, TypeSafeAPIConnectionError,
                           TypeSafeAPIError, TypeSafeUnprocessableEntityError)
 
-import book
 from questions import SETS
 
 DESK_SECRET = os.environ["DESK_SECRET"]     # for the bots. NOT the TypeSafe key.
@@ -67,20 +66,3 @@ async def judge(ask: Ask, authorization: str = Header("")):
     return {"model": r.model,
             "answers": {k: v.model_dump() for k, v in r.answers.items()},
             "usage": r.usage.model_dump()}
-
-
-# RISK lives in xAI's cloud and needs a route to free the book after a close fills.
-# This is bookkeeping, not judgement: it only says whether a position is open.
-@app.get("/book/held")
-async def book_held(authorization: str = Header("")):
-    _auth(authorization)
-    return {"held": book.held()}
-
-
-@app.post("/book/release")
-async def book_release(authorization: str = Header("")):
-    _auth(authorization)
-    was = book.held()
-    book.release()
-    log.warning("book released by RISK, was %s", was)
-    return {"released": was}

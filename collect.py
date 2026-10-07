@@ -10,6 +10,7 @@ import time
 import requests
 
 from fomo_api import Fomo
+from ids import CHAIN_NAME, token_key
 
 GT  = "https://api.geckoterminal.com/api/v2"
 DEX = "https://api.dexscreener.com/latest/dex/tokens"
@@ -17,12 +18,12 @@ SOL_RPC = "https://api.mainnet-beta.solana.com"
 log = logging.getLogger("desk.collect")
 
 # the three chains the desk trades, plus Base which shares the BSC question set
-GT_NET   = {1399811149: "solana", 4663: "robinhood", 56: "bsc", 8453: "base"}
+GT_NET   = dict(CHAIN_NAME)
 FOMO_NET = {v: k for k, v in GT_NET.items()}
-# DexScreener chainId per FOMO netId. An EVM address can exist on several chains, so
+# DexScreener chainId per desk chain. An EVM address can exist on several chains, so
 # pairs are filtered to the token's own chain. If Robinhood pairs never match, check
 # the chainId DexScreener uses for it and fix it here.
-DEX_CHAIN = {1399811149: "solana", 4663: "robinhood", 56: "bsc", 8453: "base"}
+DEX_CHAIN = {"solana": "solana", "robinhood": "robinhood", "bsc": "bsc", "base": "base"}
 
 GT_PER_MINUTE = 10                  # free tier
 _gt_calls = collections.deque()
@@ -85,7 +86,9 @@ def normalise(tid: str, m: dict) -> dict:
     """FOMO's field names become the desk's field names, once, here.
        Every file downstream reads these names and only these."""
     addr, net = tid.split(":")
-    return {"addr": addr, "net": int(net), "tid": tid, "ticker": m["symbol"],
+    chain = GT_NET.get(int(net))
+    return {"addr": addr, "net": int(net), "tid": tid, "ticker": m["symbol"], "chain": chain,
+            "token_key": token_key(chain, addr) if chain else None,
             "mcap_usd": m["mcap"], "liquidity_usd": m["liq"],
             "volume_h24": m["vol24"], "price_usd": m["price"],
             "holder_count": m["holders"] or None,
@@ -113,25 +116,33 @@ _NO_TRADES = {"buys_h1": None, "sells_h1": None, "buys_h6": None, "sells_h6": No
               "trades_h24": None, "volume_h1": None, "volume_h6": None}
 
 
+def best_pair(chain: str, addr: str) -> dict | None:
+    """The deepest DexScreener pair for this token on its own chain, or None.
+       Raises on a network failure: the caller decides what missing means."""
+    r = requests.get(f"{DEX}/{addr}", timeout=20)
+    r.raise_for_status()
+    pairs = r.json().get("pairs") or []
+    want = DEX_CHAIN.get(chain)
+    mine = [p for p in pairs if p.get("chainId") == want]
+    if pairs and not mine:
+        log.warning("dexscreener has %s only on %s, not %s", addr,
+                    sorted({p.get("chainId") for p in pairs}), want)
+    if not mine:
+        return None
+    return max(mine, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+
+
 def trade_counts(t: dict) -> dict:
     """buys and sells per window. FOMO does not return them, DexScreener does.
        Called ONLY for tokens that already cleared the free checks. One per token,
        so this runs on tens, never on the whole universe."""
     try:
-        r = requests.get(f"{DEX}/{t['addr']}", timeout=20)
-        r.raise_for_status()
-        pairs = r.json().get("pairs") or []
+        p = best_pair(t["chain"], t["addr"])
     except Exception as e:
         log.warning("dexscreener %s failed: %s", t["ticker"], e)
         return dict(_NO_TRADES)
-    chain = DEX_CHAIN.get(t["net"])
-    mine = [p for p in pairs if p.get("chainId") == chain]
-    if pairs and not mine:
-        log.warning("dexscreener has %s only on %s, not %s", t["ticker"],
-                    sorted({p.get("chainId") for p in pairs}), chain)
-    if not mine:
+    if p is None:
         return dict(_NO_TRADES)
-    p = max(mine, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
     x, v = p.get("txns") or {}, p.get("volume") or {}
     win = lambda w, side: (x.get(w) or {}).get(side)
     b24, s24 = win("h24", "buys"), win("h24", "sells")
@@ -167,11 +178,11 @@ def share(pct) -> float | None:
 
 def dossier(t: dict) -> dict:
     """One GT call per token. Fills what the chain actually has, null where it does not."""
-    net = GT_NET[t["net"]]
+    net = t["chain"]
     a = gt_get(f"/networks/{net}/tokens/{t['addr']}/info")["data"]["attributes"]
     holders = a.get("holders") or {}
 
-    d = {**t, "chain": net,
+    d = {**t,
          # GT first, FOMO as the fallback. On Robinhood GT is null and FOMO is all you get.
          "holder_count": holders.get("count") or t["holder_count"],
          "top_10_share": share((holders.get("distribution_percentage") or {})

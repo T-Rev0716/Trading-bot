@@ -31,8 +31,9 @@ def test_share_and_age():
 def test_normalise():
     m = {"symbol": "T", "mcap": 1.0, "liq": 2.0, "vol24": 3.0, "price": 4.0, "holders": 0,
          "change": {300: 0.1, 3600: 0.2}, "created": time.time() - 60}
-    t = normalise("abc:56", m)
+    t = normalise("0xABC:56", m)
     assert t["net"] == 56 and t["holder_count"] is None and t["change"]["1h"] == 0.2
+    assert t["chain"] == "bsc" and t["token_key"] == "bsc:0xabc"
 
 
 class Resp:
@@ -54,11 +55,12 @@ def test_trade_counts_filters_to_the_tokens_chain(monkeypatch):
                          "h24": {"buys": 100, "sells": 80}}}
     pairs = [pair("ethereum", 10**9, 1), pair("bsc", 5000, 7), pair("bsc", 1000, 2)]
     monkeypatch.setattr(collect.requests, "get", lambda *a, **k: Resp({"pairs": pairs}))
-    x = collect.trade_counts({"addr": "0xabc", "net": 56, "ticker": "T"})
+    x = collect.trade_counts({"addr": "0xabc", "net": 56, "chain": "bsc", "ticker": "T"})
     assert x["buys_h1"] == 7 and x["trades_h24"] == 180 and x["volume_h6"] == 60
     monkeypatch.setattr(collect.requests, "get",
                         lambda *a, **k: Resp({"pairs": [pair("ethereum", 1, 1)]}))
-    assert collect.trade_counts({"addr": "0xabc", "net": 56, "ticker": "T"})["trades_h24"] is None
+    assert collect.trade_counts({"addr": "0xabc", "net": 56, "chain": "bsc",
+                                 "ticker": "T"})["trades_h24"] is None
 
 
 def test_sol_top_wallet_skips_pools(monkeypatch):
@@ -96,7 +98,8 @@ def test_dossier_maps_gt_flags(monkeypatch):
              "twitter_handle": "coin", "gt_score_details": {"pool": 50}}
     monkeypatch.setattr(collect, "gt_get", lambda path, **p: {"data": {"attributes": attrs}})
     monkeypatch.setattr(collect, "sol_top_wallet", lambda m: 0.01)
-    d = collect.dossier({"addr": "M", "net": 1399811149, "ticker": "T", "holder_count": 1})
+    d = collect.dossier({"addr": "M", "net": 1399811149, "chain": "solana", "ticker": "T",
+                         "holder_count": 1})
     assert d["mint_authority_open"] is False and d["freeze_authority_open"] is False
     assert d["is_honeypot"] is None and d["top_10_share"] == 0.42
     assert d["holder_count"] == 500 and d["top_wallet_share"] == 0.01 and d["x_handle"] == "coin"

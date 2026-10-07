@@ -55,43 +55,7 @@ curl -X POST $JUDGE_URL -H "Authorization: Bearer $DESK_SECRET" \
 `answers.shape.choice` must be one of the four options, `probabilities` must sum to 1,
 `model` must be a version string and not an alias. If any of the three is off, stop.
 
-## The order CHIEF drops into the desk channel
+## Orders
 
-```json
-{
-  "order_id": "2026-09-23T10:15:00Z",
-  "token": {"ticker": "...", "address": "...", "network_id": 1399811149, "chain": "solana"},
-  "liquidity_usd": 48000,
-  "size_factor": 1.0,
-  "confidence": 0.78,
-  "runner_up": [["OTHER [bsc:0xabc1]", 0.12]],
-  "why": {"shape": {...}, "concentration_is_exit_risk": {...}, "...": "raw answers"},
-  "model": "jev-1.13.0"
-}
-```
-
-`confidence` is `null` when only one token survived: a choice over one option proves
-nothing, so none was asked.
-
-```
-THE ORDER, WORKED IN THIS SEQUENCE, NOBODY SKIPS AHEAD
-
-1. SIZE   reads token + size_factor + liquidity_usd. Computes the ticket by the four
-          steps in its prompt. Returns dollars, or 0 with a reason. A 0 ends the order.
-2. FILLS  reads the ticket. Checks the fee floor BEFORE sending. Sends one market
-          order through FOMO. Reports filled, fill_price, slippage_bps, partial.
-3. RISK   starts its timer the moment a fill is reported, not when the order was
-          created. Polls every 5 minutes. Fires on its own authority.
-4. CHIEF  logs the order id, the model id and every answer that produced it, then
-          sends the line to Telegram.
-
-NOBODY RE-READS `why`. It is there for the log and for you, not as an input. SIZE does
-not size up because crowd was 0.91, and RISK does not hold longer because confidence
-was high. The judgement is finished. What is left is arithmetic.
-
-NO ORDER IS ALSO AN ORDER. When pick returns nothing, CHIEF sends one line saying so
-with the reason, and the desk stands down until the next run.
-
-A ZERO TICKET OR A FAILED FILL MEANS NOTHING IS HELD. Whoever ends the order there
-calls POST $BOOK_RELEASE_URL so the desk scans again next cycle.
-```
+Live execution is disabled. Orders are created by the paper engine (`paper.py`) and
+filled by the simulated venue (`venue.py`). No bot receives or places an order.

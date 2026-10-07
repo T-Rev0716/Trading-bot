@@ -14,7 +14,6 @@ import pytest  # noqa: E402
 @pytest.fixture(autouse=True)
 def clean_book():
     import book
-    book.DB.execute("DELETE FROM position")
-    book.DB.execute("DELETE FROM bench")
+    book.DB.execute("DELETE FROM bench_v2")
     book.DB.commit()
     yield

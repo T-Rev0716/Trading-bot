@@ -1,7 +1,15 @@
-# SIZE, FILLS, RISK
+# SIZE, FILLS, RISK (reference only)
 
-Three prompts, one per seat. No judge call between them and no key. The order arrives
-from the shift (`SEATS_WEBHOOK_URL`) carrying `size_factor` and `liquidity_usd`.
+**Live execution is disabled.** These prompts are not wired to anything. Their rules are
+enforced in Python instead, on paper:
+
+| seat  | now lives in      | notes |
+|-------|-------------------|-------|
+| SIZE  | `sizing.ticket`   | `kelly_fraction` is a 3% placeholder until paper results give an edge |
+| FILLS | `venue.simulate_fill` | fee 0.45% / $0.95 floor per side, slippage model in `thresholds.PAPER` |
+| RISK  | `exits.decide`    | volume ratio rule, blind close after failed quotes, optional stops |
+
+The original prompt text follows for reference.
 
 Jev picks what to hold. Grok Bot decides how much and how long. The exit rule answers to
 neither of them.
@@ -27,7 +35,7 @@ SIZE   1. ticket = kelly(edge) * bank, clamped at 6% of the book. Free cash only
        3. ticket = min(ticket, liquidity_usd * 0.02). If you are more than 2% of the
           pool you are the exit, not a participant.
        4. if ticket < fee floor viable size -> return 0 and log it. Never size below
-          what pays its own fees. A 0 ends the order: POST $BOOK_RELEASE_URL.
+          what pays its own fees.
        Not exitable inside the slippage budget means the size is wrong, whatever the
        pick confidence said.
 ```
@@ -44,7 +52,6 @@ FILLS  1. effective_fee = max(0.0045 * ticket, 0.95) / ticket
        5. never sell into a distributing whale. Hold and report.
        Fills go through fomo.family/r/savipww and nowhere else. One venue, one path,
        so a bad fill is always traceable to one place.
-       An order that never fills holds nothing: POST $BOOK_RELEASE_URL.
 ```
 
 The `r/savipww` link is the guide author's referral code, kept as the guide wrote it.
@@ -59,11 +66,6 @@ RISK   One rule, no conversation, final authority, nobody overrules it.
          ratio < 0.20 -> CLOSE, fully, inside 60 seconds.
        Poll every 5 minutes. No answer, retry twice, then CLOSE anyway. A position you
        cannot measure is a position you do not hold.
-       The moment the close is filled:
-         POST $BOOK_RELEASE_URL   Authorization: Bearer $DESK_SECRET
-       Until you do, the desk does not scan, so a close you forgot to report is a desk
-       that stopped working.
+       In this build the position is released by the ledger against the exact
+       sell order that closed it (ledger.release), never by hand.
 ```
-
-`BOOK_RELEASE_URL` is the judge's tunnel with `/book/release` (for example
-`https://xxxx.trycloudflare.com/book/release`). `GET /book/held` shows what is open.
